@@ -8,6 +8,7 @@ from .core import (
     scan_projects,
     summarize,
     sync_project,
+    sync_projects,
 )
 
 __all__ = [
@@ -18,5 +19,6 @@ __all__ = [
     "scan_projects",
     "summarize",
     "sync_project",
+    "sync_projects",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

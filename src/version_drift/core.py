@@ -1,13 +1,12 @@
-"""Project synchronization guard for local development checkouts.
+"""Safety-first drift detection for bounded local Git checkouts.
 
-This module records repository drift in MemKraft and applies only safe
-fast-forward synchronization.  It is intentionally conservative: dirty,
-untracked, missing-upstream, or diverged repositories are reported and logged,
-never overwritten.
+VersionDrift classifies repositories before acting and applies only clean,
+behind-only fast-forwards. Dirty, untracked, ahead, diverged, detached, and
+missing-upstream repositories are reported and preserved.
 """
 from __future__ import annotations
 
-import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -16,26 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-import json
-
 SKIP_DIR_NAMES = {
-    ".cache",
-    ".git",
-    ".hg",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".svn",
-    ".tox",
-    ".venv",
-    "__pycache__",
-    "dist",
-    "build",
-    "node_modules",
-    "site-packages",
-    "vendor",
+    ".cache", ".git", ".hg", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".svn", ".tox", ".venv", "__pycache__", "build", "dist", "node_modules",
+    "site-packages", "vendor",
 }
-
 _EVENT_STORE = ".version-drift/events.jsonl"
 
 
@@ -54,61 +38,26 @@ def _now() -> str:
 def _run_git(repo: Path, args: Sequence[str], timeout_s: float = 20.0) -> GitResult:
     try:
         proc = subprocess.run(
-            ["git", "-C", str(repo), *args],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout_s,
-            check=False,
+            ["git", "-C", str(repo), *args], text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout_s, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return GitResult(ok=False, stderr=str(exc), returncode=124)
-    return GitResult(
-        ok=proc.returncode == 0,
-        stdout=proc.stdout.strip(),
-        stderr=proc.stderr.strip(),
-        returncode=proc.returncode,
-    )
-
-
-def _first_line(text: str) -> str:
-    return (text.splitlines() or [""])[0]
+        return GitResult(False, stderr=str(exc), returncode=124)
+    return GitResult(proc.returncode == 0, proc.stdout.strip(), proc.stderr.strip(), proc.returncode)
 
 
 def default_roots() -> List[str]:
-    env = os.environ.get("MEMKRAFT_PROJECT_SYNC_ROOTS", "").strip()
+    env = os.environ.get("VERSION_DRIFT_ROOTS", "").strip()
     if env:
-        parts = [part.strip() for part in env.split(os.pathsep) if part.strip()]
-        return parts
-
-    cwd = Path.cwd().resolve()
-    candidates = [
-        cwd.parent / "sano-workspace",
-        cwd.parent / "memcraft",
-        cwd,
-    ]
-    roots: List[str] = []
-    for path in candidates:
-        try:
-            if path.exists():
-                roots.append(str(path))
-        except OSError:
-            continue
-    # Preserve order, remove duplicates.
-    seen = set()
-    deduped: List[str] = []
-    for root in roots:
-        if root in seen:
-            continue
-        seen.add(root)
-        deduped.append(root)
-    return deduped
+        return [part.strip() for part in env.split(os.pathsep) if part.strip()]
+    return [str(Path.cwd().resolve())]
 
 
 def discover_projects(roots: Iterable[str], max_depth: int = 5) -> List[Path]:
-    """Find Git worktrees under roots, skipping dependency/cache directories."""
+    """Find Git worktrees under explicit roots without following hidden caches."""
     found: List[Path] = []
-    seen: set = set()
+    seen: set[Path] = set()
     for raw_root in roots:
         if not raw_root:
             continue
@@ -130,33 +79,34 @@ def discover_projects(roots: Iterable[str], max_depth: int = 5) -> List[Path]:
             if depth >= max_depth:
                 continue
             try:
-                children = sorted(current.iterdir(), key=lambda p: p.name)
+                children = sorted(current.iterdir(), key=lambda item: item.name)
             except OSError:
                 continue
             for child in reversed(children):
-                if not child.is_dir():
+                try:
+                    is_dir = child.is_dir()
+                except OSError:
                     continue
-                if child.name in SKIP_DIR_NAMES:
+                if not is_dir or child.name in SKIP_DIR_NAMES:
                     continue
-                if child.name.startswith(".") and child.name not in {".config"}:
+                if child.name.startswith(".") and child.name != ".config":
                     continue
                 stack.append((child, depth + 1))
-    return sorted(found, key=lambda p: str(p))
+    return sorted(set(found), key=lambda item: str(item))
+
+
+def _fingerprint(lines: Sequence[str]) -> str:
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
 def inspect_project(path: str, fetch: bool = False) -> Dict[str, Any]:
-    """Return a structured drift report for one Git project."""
+    """Return a normalized, non-destructive drift report for one repository."""
     repo = Path(path).expanduser().resolve()
     report: Dict[str, Any] = {
-        "schema": "version-drift/1",
-        "checked_at": _now(),
-        "path": str(repo),
-        "exists": repo.exists(),
-        "is_git": False,
-        "ok": False,
-        "state": "missing",
-        "reasons": [],
-        "actions": [],
+        "schema": "version-drift/1", "checked_at": _now(), "path": str(repo),
+        "exists": repo.exists(), "is_git": False, "ok": False,
+        "safe_to_update": False, "state": "missing", "reasons": [], "actions": [],
+        "working_files_changed": 0,
     }
     if not repo.exists():
         report["reasons"].append("path_missing")
@@ -164,42 +114,47 @@ def inspect_project(path: str, fetch: bool = False) -> Dict[str, Any]:
 
     top = _run_git(repo, ["rev-parse", "--show-toplevel"])
     if not top.ok:
-        report["state"] = "not_git"
+        report.update(state="not_git", error=top.stderr)
         report["reasons"].append("not_git")
-        report["error"] = top.stderr
         return report
-
     repo = Path(top.stdout).resolve()
-    report["path"] = str(repo)
-    report["is_git"] = True
+    report.update(path=str(repo), is_git=True)
 
     if fetch:
-        fetch_result = _run_git(repo, ["fetch", "--prune", "--tags"], timeout_s=60.0)
-        report["fetch"] = {
-            "ok": fetch_result.ok,
-            "stderr": fetch_result.stderr[-500:],
-        }
-        if not fetch_result.ok:
+        fetched = _run_git(repo, ["fetch", "--prune", "--tags"], timeout_s=60.0)
+        report["fetch"] = {"ok": fetched.ok, "stderr": fetched.stderr[-500:]}
+        report["remote_data"] = "fetched_now" if fetched.ok else "fetch_failed"
+        if not fetched.ok:
             report["reasons"].append("fetch_failed")
+    else:
+        report["remote_data"] = "local_tracking_refs"
 
     branch = _run_git(repo, ["branch", "--show-current"])
     head = _run_git(repo, ["rev-parse", "HEAD"])
     upstream = _run_git(repo, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
-    remote_name = _run_git(repo, ["config", "--get", "branch.%s.remote" % branch.stdout]) if branch.stdout else GitResult(False)
-    remote_url = _run_git(repo, ["remote", "get-url", remote_name.stdout]) if remote_name.ok and remote_name.stdout else GitResult(False)
     status = _run_git(repo, ["status", "--porcelain=v1", "-uall"])
-
+    if not status.ok:
+        report.update(
+            branch=branch.stdout,
+            head=head.stdout,
+            upstream=upstream.stdout if upstream.ok else "",
+            state="protected",
+            error=status.stderr,
+        )
+        report["reasons"].append("worktree_status_unavailable")
+        report["actions"].append("restore_git_status_before_sync")
+        return report
     dirty_lines = status.stdout.splitlines() if status.stdout else []
-    report.update({
-        "branch": branch.stdout,
-        "head": head.stdout,
-        "upstream": upstream.stdout if upstream.ok else "",
-        "remote_name": remote_name.stdout if remote_name.ok else "",
-        "remote_url": remote_url.stdout if remote_url.ok else "",
-        "dirty": bool(dirty_lines),
-        "dirty_count": len(dirty_lines),
-        "dirty_paths": [_first_line(line[3:]) for line in dirty_lines[:50]],
-    })
+    remote_name = _run_git(repo, ["config", "--get", f"branch.{branch.stdout}.remote"]) if branch.stdout else GitResult(False)
+    remote_url = _run_git(repo, ["remote", "get-url", remote_name.stdout]) if remote_name.ok and remote_name.stdout else GitResult(False)
+    report.update(
+        branch=branch.stdout, head=head.stdout, upstream=upstream.stdout if upstream.ok else "",
+        remote_name=remote_name.stdout if remote_name.ok else "",
+        remote_url=remote_url.stdout if remote_url.ok else "",
+        dirty=bool(dirty_lines), dirty_count=len(dirty_lines),
+        dirty_paths=[line[3:] for line in dirty_lines[:50]],
+        status_fingerprint=_fingerprint(dirty_lines),
+    )
 
     if not head.ok:
         report["state"] = "invalid_head"
@@ -211,41 +166,43 @@ def inspect_project(path: str, fetch: bool = False) -> Dict[str, Any]:
     if not upstream.ok or not upstream.stdout:
         report["reasons"].append("missing_upstream")
         report["actions"].append("set_or_confirm_tracking_branch")
-        report["state"] = "blocked"
-        report["ok"] = False
+        report["state"] = "protected"
         return report
 
     counts = _run_git(repo, ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
-    if counts.ok and counts.stdout:
-        parts = counts.stdout.split()
-        if len(parts) >= 2:
-            report["ahead"] = int(parts[0])
-            report["behind"] = int(parts[1])
-    else:
+    if not counts.ok or not counts.stdout:
         report["reasons"].append("ahead_behind_unavailable")
+        report["state"] = "protected"
+        return report
+    parts = counts.stdout.split()
+    report["ahead"] = int(parts[0])
+    report["behind"] = int(parts[1])
+    ahead, behind = report["ahead"], report["behind"]
 
-    ahead = int(report.get("ahead", 0) or 0)
-    behind = int(report.get("behind", 0) or 0)
-    if ahead and behind:
+    if "fetch_failed" in report["reasons"]:
+        report["state"] = "protected"
+        report["safe_to_update"] = False
+        report["actions"].append("retry_fetch_before_sync")
+    elif dirty_lines:
+        report["state"] = "protected"
+    elif ahead and behind:
+        report["state"] = "diverged"
         report["reasons"].append("diverged_from_upstream")
         report["actions"].append("manual_rebase_or_merge_required")
     elif ahead:
+        report["state"] = "ahead"
         report["reasons"].append("local_ahead_of_upstream")
         report["actions"].append("push_or_open_pr")
     elif behind:
+        report["state"] = "behind_clean"
         report["reasons"].append("local_behind_upstream")
-        if not dirty_lines:
-            report["actions"].append("fast_forward_pull_available")
-
-    if not report["reasons"]:
+        report["actions"].append("fast_forward_pull_available")
+        report["safe_to_update"] = True
+    elif report["reasons"] == ["fetch_failed"]:
+        report["state"] = "protected"
+    else:
         report["state"] = "synced"
         report["ok"] = True
-    elif report["reasons"] == ["local_behind_upstream"] and not dirty_lines:
-        report["state"] = "behind_clean"
-        report["ok"] = False
-    else:
-        report["state"] = "blocked"
-        report["ok"] = False
     return report
 
 
@@ -264,87 +221,88 @@ def record_event(report: Dict[str, Any], base_dir: Optional[str] = None, event: 
     return payload
 
 
-def scan_projects(
-    roots: Iterable[str],
-    base_dir: Optional[str] = None,
-    fetch: bool = False,
-    max_depth: int = 5,
-) -> Dict[str, Any]:
-    projects = discover_projects(roots, max_depth=max_depth)
-    reports = [inspect_project(str(path), fetch=fetch) for path in projects]
-    for report in reports:
-        record_event(report, base_dir=base_dir, event="scan")
-    summary = summarize(reports)
-    return {"summary": summary, "projects": reports}
-
-
 def summarize(reports: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     states: Dict[str, int] = {}
     for report in reports:
         state = str(report.get("state", "unknown"))
         states[state] = states.get(state, 0) + 1
     return {
-        "total": len(reports),
-        "states": states,
-        "ok": all(bool(r.get("ok")) for r in reports) if reports else True,
-        "drifted": [r["path"] for r in reports if not r.get("ok")],
+        "total": len(reports), "states": states,
+        "ok": all(bool(report.get("ok")) for report in reports) if reports else True,
+        "drifted": [report["path"] for report in reports if not report.get("ok")],
+        "safe_to_update": sum(bool(report.get("safe_to_update")) for report in reports),
+        "protected": sum(report.get("state") not in {"synced", "behind_clean"} for report in reports),
+        "working_files_changed": 0,
     }
+
+
+def scan_projects(roots: Iterable[str], base_dir: Optional[str] = None, fetch: bool = False, max_depth: int = 5) -> Dict[str, Any]:
+    reports = [inspect_project(str(path), fetch=fetch) for path in discover_projects(roots, max_depth=max_depth)]
+    for report in reports:
+        record_event(report, base_dir=base_dir, event="scan")
+    return {"summary": summarize(reports), "projects": reports}
+
+
+def _same_apply_snapshot(before: Dict[str, Any], current: Dict[str, Any]) -> bool:
+    return (
+        current.get("state") == "behind_clean"
+        and current.get("safe_to_update") is True
+        and current.get("head") == before.get("head")
+        and current.get("status_fingerprint") == before.get("status_fingerprint")
+        and current.get("upstream") == before.get("upstream")
+    )
 
 
 def sync_project(path: str, base_dir: Optional[str] = None, apply: bool = False, fetch: bool = True) -> Dict[str, Any]:
     before = inspect_project(path, fetch=fetch)
     result: Dict[str, Any] = {"before": before, "applied": False, "after": None}
-    if before.get("state") != "behind_clean":
-        result["blocked"] = True
-        result["reason"] = "only_clean_fast_forward_sync_is_allowed"
+    if before.get("state") != "behind_clean" or not before.get("safe_to_update"):
+        result.update(blocked=True, reason="only_clean_fast_forward_sync_is_allowed")
         record_event(before, base_dir=base_dir, event="sync_blocked")
         return result
     if not apply:
-        result["blocked"] = False
-        result["reason"] = "dry_run_fast_forward_available"
+        result.update(blocked=False, reason="dry_run_fast_forward_available")
         record_event(before, base_dir=base_dir, event="sync_dry_run")
         return result
-    repo = Path(str(before["path"]))
+
+    current = inspect_project(path, fetch=False)
+    if not _same_apply_snapshot(before, current):
+        result.update(blocked=True, reason="state_changed_before_apply", after=current)
+        record_event(current, base_dir=base_dir, event="sync_state_changed")
+        return result
+
+    repo = Path(str(current["path"]))
     pull = _run_git(repo, ["pull", "--ff-only"], timeout_s=120.0)
-    result["pull"] = {"ok": pull.ok, "stdout": pull.stdout[-1000:], "stderr": pull.stderr[-1000:]}
     after = inspect_project(str(repo), fetch=False)
-    result["after"] = after
-    result["applied"] = pull.ok and bool(after.get("ok"))
+    result.update(
+        blocked=not pull.ok, after=after,
+        pull={"ok": pull.ok, "stdout": pull.stdout[-1000:], "stderr": pull.stderr[-1000:]},
+        applied=pull.ok and bool(after.get("ok")),
+        reason="fast_forward_applied" if pull.ok and after.get("ok") else "fast_forward_failed",
+    )
     record_event(after, base_dir=base_dir, event="sync_applied" if result["applied"] else "sync_failed")
     return result
 
 
-def _print_human_scan(result: Dict[str, Any]) -> None:
-    summary = result["summary"]
-    print("MemKraft version-drift scan")
-    print("  total: %s" % summary["total"])
-    for state, count in sorted(summary["states"].items()):
-        print("  %s: %s" % (state, count))
-    for report in result["projects"]:
-        marker = "OK" if report.get("ok") else "DRIFT"
-        print("  [%s] %s" % (marker, report.get("path")))
-        reasons = report.get("reasons") or []
-        if reasons:
-            print("       reasons: %s" % ", ".join(reasons))
+def sync_projects(roots: Iterable[str], base_dir: Optional[str] = None, apply: bool = False, fetch: bool = True, max_depth: int = 5) -> Dict[str, Any]:
+    """Preview or apply safe fast-forwards across repositories under roots."""
+    results = [
+        sync_project(str(repo), base_dir=base_dir, apply=apply, fetch=fetch)
+        for repo in discover_projects(roots, max_depth=max_depth)
+    ]
+    summary = {
+        "total": len(results),
+        "safe": sum(item["before"].get("state") == "behind_clean" for item in results),
+        "protected": sum(item["before"].get("state") not in {"synced", "behind_clean"} for item in results),
+        "synced": sum(item["before"].get("state") == "synced" for item in results),
+        "applied": sum(bool(item.get("applied")) for item in results),
+        "failed": sum(item.get("reason") in {"fast_forward_failed", "state_changed_before_apply"} for item in results),
+        "working_files_changed": 0,
+    }
+    return {"summary": summary, "projects": results}
 
 
-def cmd(args: argparse.Namespace) -> int:
-    base_dir = getattr(args, "base_dir", "") or None
-    if args.project_sync_command == "scan":
-        roots = args.root or default_roots() or [os.getcwd()]
-        result = scan_projects(roots, base_dir=base_dir, fetch=args.fetch, max_depth=args.max_depth)
-        if args.json:
-            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-        else:
-            _print_human_scan(result)
-        return 0 if result["summary"].get("ok") else 1
-    if args.project_sync_command == "inspect":
-        report = inspect_project(args.path, fetch=args.fetch)
-        record_event(report, base_dir=base_dir, event="inspect")
-        print(json.dumps(report, ensure_ascii=False, sort_keys=True) if args.json else report)
-        return 0 if report.get("ok") else 1
-    if args.project_sync_command == "sync":
-        result = sync_project(args.path, base_dir=base_dir, apply=args.apply, fetch=not args.no_fetch)
-        print(json.dumps(result, ensure_ascii=False, sort_keys=True) if args.json else result)
-        return 0 if result.get("applied") or (not args.apply and not result.get("blocked")) else 1
-    raise SystemExit("unknown project-sync command")
+__all__ = [
+    "GitResult", "default_roots", "discover_projects", "inspect_project", "record_event",
+    "scan_projects", "summarize", "sync_project", "sync_projects",
+]

@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose a focused improvement that preserves the safety contract
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What recurring Git checkup problem should VersionDrift solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety fit
+      options:
+        - label: The proposal does not require reset, auto-stash, clean, merge, rebase, force, or push.
+          required: true
