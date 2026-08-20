@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "version-drift"
+version = "0.1.0"
+description = "Detect Git checkout drift and safely fast-forward clean projects"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [{name = "Seojun Kim", email = "simonkim.nft@gmail.com"}]
+keywords = ["git", "version-control", "drift-detection", "developer-tools", "automation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Version Control :: Git",
+]
+
+[project.scripts]
+version-drift = "version_drift.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
