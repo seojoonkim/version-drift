@@ -44,8 +44,10 @@ jobs:
           /tmp/version-drift-release/bin/version-drift --version
           /tmp/version-drift-release/bin/version-drift --help
           /tmp/version-drift-release/bin/python -m pip check
-      - name: Publish to PyPI with Trusted Publishing
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
       - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@v2
         with:
