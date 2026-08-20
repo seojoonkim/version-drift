@@ -10,6 +10,20 @@ It detects dirty worktrees, untracked files, missing upstreams, local-ahead bran
 python -m pip install version-drift
 ```
 
+For isolated CLI use:
+
+```bash
+pipx install version-drift
+```
+
+For local development:
+
+```bash
+git clone https://github.com/seojoonkim/version-drift.git
+cd version-drift
+python -m pip install -e .
+```
+
 ## Use
 
 ```bash
@@ -24,12 +38,14 @@ Events are written to `.version-drift/events.jsonl` under the current directory 
 
 VersionDrift never runs `git reset --hard`, force-push, destructive checkout, or automatic stash/drop. Dirty, untracked, ahead, diverged, and missing-upstream repositories are reported and left untouched.
 
-MemKraft includes the same `version_drift` engine and exposes it as:
+## Relation to MemKraft
+
+MemKraft can reuse the same `version_drift` engine when it is installed, and it also keeps a fallback path so the MemKraft CLI still works if the standalone package is absent.
 
 ```bash
 memkraft version-drift scan --root ~/code --json
 ```
 
-The two commands use the same module name and behavior without sharing files, entry-point names, or state directories in a way that causes installation conflicts.
+The standalone package and the MemKraft integration do not share entry-point names or runtime state directories, so they can be installed together without collisions.
 
 License: MIT
