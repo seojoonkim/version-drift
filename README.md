@@ -6,15 +6,19 @@ It detects dirty worktrees, untracked files, missing upstreams, local-ahead bran
 
 ## Install
 
+Install the published GitHub Release wheel:
+
 ```bash
-python -m pip install version-drift
+python -m pip install https://github.com/seojoonkim/version-drift/releases/download/v0.1.0/version_drift-0.1.0-py3-none-any.whl
 ```
 
 For isolated CLI use:
 
 ```bash
-pipx install version-drift
+pipx install https://github.com/seojoonkim/version-drift/releases/download/v0.1.0/version_drift-0.1.0-py3-none-any.whl
 ```
+
+PyPI publication is not active yet. Until it is, use the versioned GitHub Release URL above rather than `pip install version-drift`.
 
 For local development:
 
