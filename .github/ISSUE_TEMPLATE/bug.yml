@@ -1,0 +1,35 @@
+name: Bug report
+description: Report incorrect classification, output, or safety behavior
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping improve VersionDrift. Remove private paths and remote URLs before posting output.
+  - type: input
+    id: version
+    attributes:
+      label: VersionDrift version
+      placeholder: version-drift 0.2.0
+    validations:
+      required: true
+  - type: dropdown
+    id: command
+    attributes:
+      label: Command
+      options: [scan, inspect, sync dry-run, sync --apply]
+    validations:
+      required: true
+  - type: textarea
+    id: state
+    attributes:
+      label: Repository state and expected result
+      description: Describe dirty/untracked/ahead/behind/diverged/upstream status without secrets.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+    validations:
+      required: true

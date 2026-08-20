@@ -2,7 +2,8 @@ import json
 import subprocess
 from pathlib import Path
 
-from version_drift import inspect_project, record_event
+import version_drift.core as core
+from version_drift import inspect_project, record_event, scan_projects, sync_projects
 from version_drift.cli import main
 
 
@@ -27,6 +28,37 @@ def _init_repo(path: Path) -> None:
     _git(path, "commit", "-m", "init")
 
 
+def _remote_clone(tmp_path: Path) -> tuple[Path, Path, Path]:
+    seed = tmp_path / "seed"
+    remote = tmp_path / "remote.git"
+    clone = tmp_path / "clone"
+    _init_repo(seed)
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "push", "-u", "origin", "HEAD")
+    subprocess.run(["git", "clone", str(remote), str(clone)], check=True, capture_output=True)
+    _git(clone, "config", "user.email", "test@example.com")
+    _git(clone, "config", "user.name", "Test User")
+    return seed, remote, clone
+
+
+def _commit(path: Path, filename: str, text: str, message: str) -> None:
+    (path / filename).write_text(text, encoding="utf-8")
+    _git(path, "add", filename)
+    _git(path, "commit", "-m", message)
+
+
+def test_default_roots_uses_version_drift_env(monkeypatch, tmp_path):
+    one = tmp_path / "one"
+    two = tmp_path / "two"
+    one.mkdir()
+    two.mkdir()
+    monkeypatch.setenv("VERSION_DRIFT_ROOTS", f"{one}:{two}")
+    monkeypatch.setenv("MEMKRAFT_PROJECT_SYNC_ROOTS", "/must/not/be/used")
+
+    assert core.default_roots() == [str(one), str(two)]
+
+
 def test_inspect_and_event_store(tmp_path):
     repo = tmp_path / "repo"
     _init_repo(repo)
@@ -38,11 +70,254 @@ def test_inspect_and_event_store(tmp_path):
     assert (tmp_path / "state" / ".version-drift" / "events.jsonl").exists()
 
 
-def test_cli_help_and_json(tmp_path, capsys):
+def test_inspect_classifies_synced_repository(tmp_path):
+    _, _, clone = _remote_clone(tmp_path)
+
+    report = inspect_project(str(clone))
+
+    assert report["state"] == "synced"
+    assert report["ok"] is True
+    assert report["ahead"] == 0
+    assert report["behind"] == 0
+
+
+def test_inspect_classifies_clean_behind_repository(tmp_path):
+    seed, _, clone = _remote_clone(tmp_path)
+    _commit(seed, "remote.txt", "remote\n", "remote")
+    _git(seed, "push")
+
+    report = inspect_project(str(clone), fetch=True)
+
+    assert report["state"] == "behind_clean"
+    assert report["behind"] == 1
+    assert report["safe_to_update"] is True
+
+
+def test_fetch_failure_is_fail_closed_even_when_tracking_ref_is_behind(tmp_path):
+    seed, _, clone = _remote_clone(tmp_path)
+    _commit(seed, "remote.txt", "remote\n", "remote")
+    _git(seed, "push")
+    _git(clone, "fetch")
+    _git(clone, "remote", "set-url", "origin", str(tmp_path / "missing-remote.git"))
+
+    report = inspect_project(str(clone), fetch=True)
+
+    assert "fetch_failed" in report["reasons"]
+    assert report["state"] == "protected"
+    assert report["safe_to_update"] is False
+
+
+def test_inspect_protects_untracked_work(tmp_path):
+    _, _, clone = _remote_clone(tmp_path)
+    untracked = clone / "notes.txt"
+    untracked.write_text("keep me\n", encoding="utf-8")
+
+    report = inspect_project(str(clone))
+
+    assert report["state"] == "protected"
+    assert "dirty_worktree" in report["reasons"]
+    assert report["ok"] is False
+    assert report["safe_to_update"] is False
+    assert untracked.read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_inspect_protects_dirty_repository_that_is_behind(tmp_path):
+    seed, _, clone = _remote_clone(tmp_path)
+    (clone / "notes.txt").write_text("keep me\n", encoding="utf-8")
+    _commit(seed, "remote.txt", "remote\n", "remote")
+    _git(seed, "push")
+
+    report = inspect_project(str(clone), fetch=True)
+
+    assert report["state"] == "protected"
+    assert "dirty_worktree" in report["reasons"]
+    assert report["behind"] == 1
+    assert report["ok"] is False
+    assert report["safe_to_update"] is False
+
+
+def test_inspect_fails_closed_when_status_is_unavailable(monkeypatch, tmp_path):
+    _, _, clone = _remote_clone(tmp_path)
+    real = core._run_git
+
+    def fail_status(repo, args, timeout_s=20.0):
+        if list(args) == ["status", "--porcelain=v1", "-uall"]:
+            return core.GitResult(False, stderr="status unavailable", returncode=128)
+        return real(repo, args, timeout_s)
+
+    monkeypatch.setattr(core, "_run_git", fail_status)
+    report = inspect_project(str(clone))
+
+    assert report["state"] == "protected"
+    assert "worktree_status_unavailable" in report["reasons"]
+    assert report["ok"] is False
+    assert report["safe_to_update"] is False
+
+
+def test_inspect_classifies_local_ahead(tmp_path):
+    _, _, clone = _remote_clone(tmp_path)
+    _commit(clone, "local.txt", "local\n", "local")
+
+    report = inspect_project(str(clone))
+
+    assert report["state"] == "ahead"
+    assert report["ahead"] == 1
+    assert report["safe_to_update"] is False
+
+
+def test_inspect_classifies_diverged(tmp_path):
+    seed, _, clone = _remote_clone(tmp_path)
+    _commit(seed, "remote.txt", "remote\n", "remote")
+    _git(seed, "push")
+    _commit(clone, "local.txt", "local\n", "local")
+
+    report = inspect_project(str(clone), fetch=True)
+
+    assert report["state"] == "diverged"
+    assert report["ahead"] == 1
+    assert report["behind"] == 1
+    assert report["safe_to_update"] is False
+
+
+def test_scan_does_not_change_working_files(tmp_path):
+    _, _, clone = _remote_clone(tmp_path)
+    local = clone / "local.txt"
+    local.write_text("precious\n", encoding="utf-8")
+    before_head = _git(clone, "rev-parse", "HEAD")
+    before_status = _git(clone, "status", "--porcelain=v1", "-uall")
+
+    scan_projects([str(tmp_path)], base_dir=str(tmp_path / "state"))
+
+    assert local.read_text(encoding="utf-8") == "precious\n"
+    assert _git(clone, "rev-parse", "HEAD") == before_head
+    assert _git(clone, "status", "--porcelain=v1", "-uall") == before_status
+
+
+def test_cli_accepts_positional_roots_and_scan_drift_is_success(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+
+    rc = main(["--base-dir", str(tmp_path / "state"), "scan", str(tmp_path)])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "VersionDrift scanned 1 repository" in out
+    assert "local work protected" in out or "no upstream" in out
+    assert "Working files changed: 0" in out
+
+
+def test_cli_check_returns_one_when_drift_exists(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+
+    rc = main(["--base-dir", str(tmp_path / "state"), "scan", str(tmp_path), "--check"])
+
+    assert rc == 1
+
+
+def test_cli_json_scan_remains_machine_readable(tmp_path, capsys):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+
+    rc = main(["--base-dir", str(tmp_path / "state"), "scan", str(tmp_path), "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["summary"]["total"] == 1
+    assert payload["summary"]["working_files_changed"] == 0
+
+
+def test_sync_projects_dry_run_lists_safe_and_protected(tmp_path):
+    seed, _, safe = _remote_clone(tmp_path)
+    _commit(seed, "remote.txt", "remote\n", "remote")
+    _git(seed, "push")
+    protected = tmp_path / "protected"
+    subprocess.run(["git", "clone", str(tmp_path / "remote.git"), str(protected)], check=True, capture_output=True)
+    (protected / "notes.txt").write_text("keep\n", encoding="utf-8")
+
+    result = sync_projects([str(tmp_path)], base_dir=str(tmp_path / "state"), apply=False, fetch=True)
+
+    assert result["summary"]["safe"] == 1
+    assert result["summary"]["protected"] >= 1
+    assert result["summary"]["applied"] == 0
+    assert not (safe / "remote.txt").exists()
+    assert (protected / "notes.txt").read_text(encoding="utf-8") == "keep\n"
+
+
+def test_sync_projects_applies_only_clean_fast_forwards(tmp_path):
+    seed, _, safe = _remote_clone(tmp_path)
+    _commit(seed, "remote.txt", "remote\n", "remote")
+    _git(seed, "push")
+    dirty = tmp_path / "dirty"
+    subprocess.run(["git", "clone", str(tmp_path / "remote.git"), str(dirty)], check=True, capture_output=True)
+    (dirty / "notes.txt").write_text("keep\n", encoding="utf-8")
+    _commit(seed, "second.txt", "second\n", "second")
+    _git(seed, "push")
+
+    result = sync_projects([str(tmp_path)], base_dir=str(tmp_path / "state"), apply=True, fetch=True)
+
+    assert result["summary"]["applied"] == 1
+    assert (safe / "remote.txt").exists()
+    assert (safe / "second.txt").exists()
+    assert (dirty / "notes.txt").read_text(encoding="utf-8") == "keep\n"
+
+
+def test_sync_project_aborts_if_state_changes_before_apply(monkeypatch, tmp_path):
+    before = {
+        "schema": "version-drift/1",
+        "path": str(tmp_path / "repo"),
+        "state": "behind_clean",
+        "safe_to_update": True,
+        "head": "abc",
+        "status_fingerprint": "clean",
+        "ok": False,
+        "reasons": ["local_behind_upstream"],
+    }
+    changed = dict(before, state="protected", safe_to_update=False, status_fingerprint="dirty")
+    reports = iter([before, changed])
+    monkeypatch.setattr(core, "inspect_project", lambda *args, **kwargs: next(reports))
+    calls = []
+    monkeypatch.setattr(core, "_run_git", lambda repo, args, timeout_s=20.0: calls.append(args))
+
+    result = core.sync_project(str(tmp_path / "repo"), apply=True, fetch=False)
+
+    assert result["applied"] is False
+    assert result["reason"] == "state_changed_before_apply"
+    assert ["pull", "--ff-only"] not in calls
+
+
+def test_sync_uses_only_documented_non_destructive_git_commands(monkeypatch, tmp_path):
+    _, _, clone = _remote_clone(tmp_path)
+    seen = []
+    real = core._run_git
+
+    def recording(repo, args, timeout_s=20.0):
+        seen.append(tuple(args))
+        return real(repo, args, timeout_s)
+
+    monkeypatch.setattr(core, "_run_git", recording)
+    core.sync_project(str(clone), apply=True, fetch=False)
+
+    forbidden = {"reset", "stash", "clean", "merge", "rebase", "checkout", "switch", "push"}
+    assert not any(command and command[0] in forbidden for command in seen)
+
+
+def test_event_log_contains_sync_decisions(tmp_path):
+    _, _, clone = _remote_clone(tmp_path)
+
+    core.sync_project(str(clone), base_dir=str(tmp_path / "state"), apply=True, fetch=False)
+
+    path = tmp_path / "state" / ".version-drift" / "events.jsonl"
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert events[-1]["event"] == "sync_blocked"
+    assert events[-1]["schema"] == "version-drift/1"
+
+
+def test_cli_inspect_json_preserves_blocked_exit_code(tmp_path, capsys):
     repo = tmp_path / "repo"
     _init_repo(repo)
     rc = main(["--base-dir", str(tmp_path / "state"), "inspect", str(repo), "--json"])
     assert rc == 1
     out = capsys.readouterr().out
     assert '"schema": "version-drift/1"' in out
-    assert '"state": "blocked"' in out
+    assert '"state": "protected"' in out

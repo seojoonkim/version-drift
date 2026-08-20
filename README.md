@@ -1,26 +1,50 @@
 # VersionDrift
 
-VersionDrift is a standalone, safety-first Git checkout drift detector for developers and coding agents.
+**Find every out-of-sync Git repo on your machine, without touching your work.**
 
-It detects dirty worktrees, untracked files, missing upstreams, local-ahead branches, diverged history, invalid HEADs, and clean branches that are behind their upstream. It only applies `git pull --ff-only` when the checkout is clean and fast-forwardable.
+VersionDrift is a safety-first Git checkup for developers with more repositories than they can keep track of. It scans only the local directories you provide, separates safe fast-forwards from local work that must be protected, and records every decision locally.
+
+```console
+$ version-drift scan ~/code --fetch
+VersionDrift scanned 17 repositories under ~/code
+
+  ✓ 10  in sync
+  ↓  3  safe to update
+  !  2  local work protected
+  ↑  1  ahead of upstream
+  ↕  1  diverged
+
+Safe to update
+  docs                             2 commits behind
+  website                          4 commits behind
+
+Protected. VersionDrift will not touch these
+  client-api                       dirty_worktree
+  prototype                        diverged_from_upstream
+
+Working files changed: 0
+Remote data: refreshed now
+```
+
+The example above illustrates the output format. It is not an adoption claim or benchmark.
 
 ## Install
 
-Install the published GitHub Release wheel:
+Until the first PyPI release is live, install the versioned GitHub Release wheel:
 
 ```bash
-python -m pip install https://github.com/seojoonkim/version-drift/releases/download/v0.1.0/version_drift-0.1.0-py3-none-any.whl
+pipx install https://github.com/seojoonkim/version-drift/releases/download/v0.2.0/version_drift-0.2.0-py3-none-any.whl
 ```
 
-For isolated CLI use:
+After PyPI publication, the canonical commands will be:
 
 ```bash
-pipx install https://github.com/seojoonkim/version-drift/releases/download/v0.1.0/version_drift-0.1.0-py3-none-any.whl
+uv tool install version-drift
+# or
+pipx install version-drift
 ```
 
-PyPI publication is not active yet. Until it is, use the versioned GitHub Release URL above rather than `pip install version-drift`.
-
-For local development:
+For development:
 
 ```bash
 git clone https://github.com/seojoonkim/version-drift.git
@@ -28,28 +52,103 @@ cd version-drift
 python -m pip install -e .
 ```
 
-## Use
+## Run your first Git checkup
 
 ```bash
-version-drift scan --root ~/code --max-depth 4 --json
-version-drift inspect /absolute/path/to/project --json
-version-drift sync /absolute/path/to/project --apply --json
+version-drift scan ~/code --fetch
 ```
 
-Events are written to `.version-drift/events.jsonl` under the current directory by default. Set `VERSION_DRIFT_DIR` or pass `--base-dir` to choose another state directory.
+`scan` never modifies working files, the index, local commits, or branches. Without `--fetch`, it compares against local remote-tracking refs. With `--fetch`, it first runs a non-destructive fetch so the comparison is current.
+
+## Why VersionDrift?
+
+A loop that runs `git pull` everywhere can stop on dirty work, create conflicts, or conceal work behind an automatic stash. VersionDrift takes the opposite approach:
+
+1. Discover repositories only inside roots you provide.
+2. Classify every repository before taking action.
+3. Protect anything dirty, ahead, diverged, ambiguous, or missing an upstream.
+4. Fast-forward only repositories proven safe at execution time.
+5. Record every decision locally as JSONL.
 
 ## Safety contract
 
-VersionDrift never runs `git reset --hard`, force-push, destructive checkout, or automatic stash/drop. Dirty, untracked, ahead, diverged, and missing-upstream repositories are reported and left untouched.
+VersionDrift will never automatically:
 
-## Relation to MemKraft
+- reset your working tree
+- stash or drop changes
+- clean untracked files
+- merge or rebase branches
+- force-pull or force-push
+- guess a missing upstream
 
-MemKraft can reuse the same `version_drift` engine when it is installed, and it also keeps a fallback path so the MemKraft CLI still works if the standalone package is absent.
+`sync --apply` is allowed only when a repository is clean, tracks an upstream, and is behind-only. VersionDrift checks the state again immediately before running exactly `git pull --ff-only`; if the snapshot changed, it aborts.
+
+## Commands
+
+### Scan one or more roots
 
 ```bash
-memkraft version-drift scan --root ~/code --json
+version-drift scan ~/code ~/work
 ```
 
-The standalone package and the MemKraft integration do not share entry-point names or runtime state directories, so they can be installed together without collisions.
+- `--fetch`: refresh remote-tracking refs first
+- `--json`: emit machine-readable output
+- `--check`: return exit code 1 when drift exists
+- `--max-depth N`: bound discovery depth
 
-License: MIT
+Set repeatable default roots with your platform path separator:
+
+```bash
+export VERSION_DRIFT_ROOTS="$HOME/code:$HOME/work"
+version-drift scan
+```
+
+### Inspect one repository
+
+```bash
+version-drift inspect ~/code/project --fetch --json
+```
+
+### Preview safe synchronization
+
+```bash
+version-drift sync ~/code
+```
+
+### Apply safe fast-forwards
+
+```bash
+version-drift sync ~/code --apply
+```
+
+Repositories with local work or ambiguous history remain untouched.
+
+## JSON and local decision events
+
+Every scan and sync decision is appended to:
+
+```text
+.version-drift/events.jsonl
+```
+
+The current schema is `version-drift/1`. Choose another state root with `--base-dir` or `VERSION_DRIFT_DIR`.
+
+VersionDrift sends no telemetry and never uploads repository paths, remotes, or results.
+
+## VersionDrift, Gita, and myrepos
+
+Gita and myrepos are strong choices for broad multi-repository management or arbitrary commands. VersionDrift is deliberately narrower: fail-closed diagnosis plus clean fast-forward-only reconciliation.
+
+Choose VersionDrift when you want a read-only first run, a fixed non-destructive policy, apply-time revalidation, machine-readable decisions, and a local audit trail.
+
+## MemKraft integration
+
+MemKraft can optionally use the standalone `version_drift` engine. VersionDrift remains independently installable and owns the `version-drift` command.
+
+## Contributing
+
+Bug reports and focused pull requests are welcome. Safety invariants are part of the public API and cannot be weakened for convenience. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+[MIT](LICENSE)
