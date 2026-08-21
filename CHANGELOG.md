@@ -2,6 +2,31 @@
 
 All notable changes to VersionDrift are documented here.
 
+## [1.0.0] - 2026-08-22
+
+### Added
+
+- Frozen v1 JSON contracts for inspection/events, scan, sync, plan, and doctor, with explicit `complete`, `partial`, and `failed` outcomes.
+- `sync --plan` structured observations with explicit fetch controls and no authorization of later apply.
+- Read-only `doctor` diagnostics for the runtime, Git, configuration, event history, inbox snapshot, apply locks, and state directory.
+- Additive `relation`, `eligibility`, and `reason_codes` facts while retaining legacy report fields.
+- Apply lifecycle events, per-repository duplicate-concurrency locks, and post-pull verification including explicit unknown outcomes.
+- Compatibility, threat-model, and operations documentation for the supported 1.x contract.
+
+### Changed
+
+- Apply now independently reinspects immediately before execution, blocks unsupported or unknown repository topology, runs only `git pull --ff-only`, and verifies the resulting state.
+- Scan and sync envelopes distinguish policy blocks from operationally partial or failed runs.
+- Package and runtime versions are synchronized at `1.0.0`; Python 3.9 remains the minimum supported runtime.
+
+### Fixed
+
+- Fail closed for uninspectable explicit scopes, Gitlink-only submodule trees, state/lock/event I/O failures, and successful pulls whose final state cannot be verified; operational scan failures now return a nonzero exit without requiring `--check`.
+
+### Compatibility
+
+- VersionDrift 1.x retains established report fields and safety meanings. Changes within 1.x are additive; removals or semantic breaks require the next major version.
+
 ## [0.5.0] - 2026-08-22
 
 ### Added

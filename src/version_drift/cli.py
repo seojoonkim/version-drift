@@ -10,7 +10,16 @@ from typing import Any, Optional, Sequence
 
 from . import __version__
 from .config import config_path, resolve_roots, write_config
-from .core import discover_projects, history, inspect_project, record_event, scan_projects, sync_projects
+from .core import (
+    discover_projects,
+    history,
+    inspect_project,
+    plan_projects,
+    record_event,
+    scan_projects,
+    sync_projects,
+)
+from .doctor import run_doctor
 from .explain import explain_reports
 from .inbox import build_inbox
 
@@ -60,6 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
     history_parser.add_argument("--event", action="append", default=[])
     history_parser.add_argument("--json", action="store_true")
 
+    doctor = sub.add_parser("doctor", help="Check the runtime and local VersionDrift state")
+    doctor.add_argument("--json", action="store_true")
+
     inspect = sub.add_parser("inspect", help="Inspect one Git repository")
     inspect.add_argument("path")
     inspect.add_argument("--fetch", action="store_true")
@@ -67,8 +79,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sync = sub.add_parser("sync", help="Preview or apply clean fast-forwards under roots")
     sync.add_argument("paths", nargs="+", help="One repository or one or more roots")
-    sync.add_argument("--apply", action="store_true")
-    sync.add_argument("--no-fetch", action="store_true")
+    mode = sync.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true")
+    mode.add_argument("--plan", action="store_true")
+    fetching = sync.add_mutually_exclusive_group()
+    fetching.add_argument("--fetch", dest="fetch", action="store_true")
+    fetching.add_argument("--no-fetch", dest="fetch", action="store_false")
+    sync.set_defaults(fetch=True)
     sync.add_argument("--max-depth", type=int, default=5)
     sync.add_argument("--json", action="store_true")
     return parser
@@ -131,6 +148,19 @@ def _print_sync(result: dict[str, Any], apply: bool) -> None:
     print(f"Working files changed: {summary['working_files_changed']}")
 
 
+def _print_plan(result: dict[str, Any]) -> None:
+    summary = result["summary"]
+    print(f"Planned fast-forwards: {summary['planned']}")
+    print(f"Blocked repositories: {summary['blocked']}")
+    if summary["unknown"]:
+        print(f"Unknown repositories: {summary['unknown']}")
+    for repository in result["repositories"]:
+        reasons = ", ".join(repository["reason_codes"]) or "no reason recorded"
+        print(f"  {repository['path']}: {repository['planned_action']} ({reasons})")
+    print(result["authorization"])
+    print("Nothing was changed.")
+
+
 def _resolved_scan_roots(args: argparse.Namespace) -> list[str]:
     roots = [*(args.roots or []), *(args.root or [])]
     return resolve_roots(roots)
@@ -184,12 +214,26 @@ def _print_history(result: dict[str, Any]) -> None:
     print("Nothing was changed.")
 
 
+def _print_doctor(result: dict[str, Any]) -> None:
+    print(f"VersionDrift doctor: {'ok' if result['ok'] else 'issues found'}")
+    for check in result["checks"]:
+        print(f"  {'✓' if check['ok'] else '!'} {check['name']}: {check['detail']}")
+    print("Nothing was changed.")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     base_dir = args.base_dir or None
     if hasattr(args, "max_depth") and args.max_depth < 0:
         print(f"version-drift {args.command}: max depth must be non-negative", file=sys.stderr)
         return 2
+    if args.command == "doctor":
+        result = run_doctor(base_dir)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        else:
+            _print_doctor(result)
+        return 0 if result["ok"] else 1
     if args.command == "init":
         try:
             roots = write_config(args.roots)
@@ -210,6 +254,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         else:
             _print_scan(result, roots)
+        if result["outcome"] in {"partial", "failed"}:
+            return 3
         return 1 if args.check and not result["summary"]["ok"] else 0
     if args.command == "inbox":
         try:
@@ -262,25 +308,40 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
     if args.command == "inspect":
         report = inspect_project(args.path, fetch=args.fetch)
-        record_event(report, base_dir=base_dir, event="inspect")
+        try:
+            record_event(report, base_dir=base_dir, event="inspect")
+        except (OSError, UnicodeError, ValueError, TypeError):
+            report["ok"] = False
+            report.setdefault("reasons", []).append("event_write_failed")
+            report["reason_codes"] = list(report["reasons"])
         print(json.dumps(report, ensure_ascii=False, sort_keys=True) if args.json else report)
         return 0 if report.get("ok") else 1
 
     paths = args.paths
+    max_depth = 0 if len(paths) == 1 and (Path(paths[0]).expanduser() / ".git").exists() else args.max_depth
+    if args.plan:
+        result = plan_projects(paths, base_dir=base_dir, fetch=args.fetch, max_depth=max_depth)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        else:
+            _print_plan(result)
+        return 1 if result["outcome"] in {"partial", "failed"} else 0
     if len(paths) == 1 and (Path(paths[0]).expanduser() / ".git").exists():
-        result = sync_projects(paths, base_dir=base_dir, apply=args.apply, fetch=not args.no_fetch, max_depth=0)
+        result = sync_projects(paths, base_dir=base_dir, apply=args.apply, fetch=args.fetch, max_depth=0)
         if args.json:
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         else:
             _print_sync(result, args.apply)
+        if result["outcome"] in {"partial", "failed"}:
+            return 3
         item = result["projects"][0]
         return 0 if item.get("applied") or (not args.apply and not item.get("blocked")) else 1
-    result = sync_projects(paths, base_dir=base_dir, apply=args.apply, fetch=not args.no_fetch, max_depth=args.max_depth)
+    result = sync_projects(paths, base_dir=base_dir, apply=args.apply, fetch=args.fetch, max_depth=args.max_depth)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     else:
         _print_sync(result, args.apply)
-    return 2 if result["summary"]["failed"] else 0
+    return 3 if result["outcome"] in {"partial", "failed"} else 0
 
 
 def cmd(args: argparse.Namespace) -> int:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "version-drift"
-version = "0.5.0"
+version = "1.0.0"
 description = "Detect Git checkout drift and safely fast-forward clean projects"
 readme = "README.md"
 license = "MIT"
@@ -12,7 +12,7 @@ requires-python = ">=3.9"
 authors = [{name = "Seojun Kim", email = "simon@hashed.com"}]
 keywords = ["git", "version-control", "drift-detection", "developer-tools", "automation"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",

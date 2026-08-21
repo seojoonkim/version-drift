@@ -26,6 +26,12 @@ SKIP_DIR_NAMES = {
 }
 _EVENT_STORE = ".version-drift/events.jsonl"
 HISTORY_SCHEMA = "version-drift/history/1"
+PLAN_SCHEMA = "version-drift/plan/1"
+SCAN_SCHEMA = "version-drift/scan/1"
+SYNC_SCHEMA = "version-drift/sync/1"
+PLAN_AUTHORIZATION = (
+    "This plan grants no authorization; apply independently reinspects every repository."
+)
 
 
 def validate_max_depth(max_depth: int) -> int:
@@ -40,6 +46,12 @@ class GitResult:
     stdout: str = ""
     stderr: str = ""
     returncode: int = 0
+
+
+@dataclass(frozen=True)
+class _DiscoveryResult:
+    projects: List[Path]
+    failures: List[Path]
 
 
 def _now() -> str:
@@ -90,10 +102,11 @@ def _path_has_symlink_component(path: Path) -> bool:
     return False
 
 
-def discover_projects(roots: Iterable[str], max_depth: int = 5) -> List[Path]:
-    """Find Git worktrees under explicit roots without following hidden caches."""
+def _discover_projects_detailed(roots: Iterable[str], max_depth: int = 5) -> _DiscoveryResult:
+    """Discover worktrees and retain traversal failures as local scope facts."""
     validate_max_depth(max_depth)
     found: List[Path] = []
+    failures: List[Path] = []
     seen: set[Path] = set()
     for raw_root in roots:
         if not raw_root:
@@ -101,44 +114,238 @@ def discover_projects(roots: Iterable[str], max_depth: int = 5) -> List[Path]:
         candidate = Path(raw_root).expanduser()
         if _path_has_symlink_component(candidate):
             continue
-        root = candidate.resolve()
-        if not root.exists():
+        try:
+            root = candidate.resolve()
+            exists = root.exists()
+        except OSError:
+            failures.append(candidate.absolute())
+            continue
+        if not exists:
             continue
         stack: List[Tuple[Path, int]] = [(root, 0)]
         while stack:
             current, depth = stack.pop()
             try:
                 real = current.resolve()
+                is_symlink = current.is_symlink()
             except OSError:
+                failures.append(current.absolute())
                 continue
-            if current.is_symlink():
+            if is_symlink:
                 continue
             if real in seen:
                 continue
             seen.add(real)
-            if (current / ".git").exists():
+            try:
+                is_project = (current / ".git").exists()
+            except OSError:
+                failures.append(current.absolute())
+                continue
+            if is_project:
                 found.append(current)
             if depth >= max_depth:
                 continue
             try:
                 children = sorted(current.iterdir(), key=lambda item: item.name)
             except OSError:
+                failures.append(current.absolute())
                 continue
             for child in reversed(children):
                 try:
                     is_dir = child.is_dir()
                 except OSError:
+                    failures.append(child.absolute())
                     continue
                 if not is_dir or child.name in SKIP_DIR_NAMES:
                     continue
                 if child.name.startswith(".") and child.name != ".config":
                     continue
                 stack.append((child, depth + 1))
-    return sorted(set(found), key=lambda item: str(item))
+    return _DiscoveryResult(
+        projects=sorted(set(found), key=str),
+        failures=sorted(set(failures), key=str),
+    )
+
+
+def discover_projects(roots: Iterable[str], max_depth: int = 5) -> List[Path]:
+    """Find Git worktrees under explicit roots without following hidden caches."""
+    return _discover_projects_detailed(roots, max_depth=max_depth).projects
+
+
+_PUBLIC_DISCOVER_PROJECTS = discover_projects
+
+
+def _scope_projects(
+    roots: Sequence[str], max_depth: int, explicit_targets: bool
+) -> _DiscoveryResult:
+    """Discover worktrees while retaining uninspectable scopes fail-closed."""
+    if discover_projects is _PUBLIC_DISCOVER_PROJECTS:
+        discovery = _discover_projects_detailed(roots, max_depth=max_depth)
+        projects = discovery.projects
+        failures = discovery.failures
+    else:
+        projects = discover_projects(roots, max_depth=max_depth)
+        failures = []
+    additions: List[Path] = []
+    for raw_root in roots:
+        if not raw_root:
+            continue
+        candidate = Path(raw_root).expanduser()
+        if _path_has_symlink_component(candidate):
+            failures.append(candidate.absolute())
+            continue
+        try:
+            root = candidate.resolve()
+            if not root.exists():
+                additions.append(root)
+                continue
+            next(root.iterdir(), None)
+            represented = any(project == root or root in project.parents for project in projects)
+            if represented:
+                continue
+            # Only probe an otherwise unrepresented explicit target. This retains bare
+            # repositories without adding ordinary empty roots to scan/plan results.
+            bare = _run_git(root, ["rev-parse", "--is-bare-repository"])
+            if bare.ok and bare.stdout == "true":
+                additions.append(root)
+            elif explicit_targets:
+                additions.append(root)
+        except OSError:
+            additions.append(candidate.absolute())
+    project_set = set(projects) | set(additions)
+    return _DiscoveryResult(
+        projects=sorted(project_set, key=str),
+        failures=sorted(set(failures) - project_set, key=str),
+    )
 
 
 def _fingerprint(lines: Sequence[str]) -> str:
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def _finalize_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach orthogonal relation and eligibility facts to an inspection report."""
+    ahead = report.get("ahead")
+    behind = report.get("behind")
+    if isinstance(ahead, int) and isinstance(behind, int) and ahead >= 0 and behind >= 0:
+        if ahead and behind:
+            relation = "diverged"
+        elif ahead:
+            relation = "ahead"
+        elif behind:
+            relation = "behind"
+        else:
+            relation = "in_sync"
+    else:
+        relation = "unknown"
+
+    hardening_reasons = {
+        "detached_head", "operation_in_progress", "shallow_repository",
+        "linked_worktree", "submodule_checkout", "contains_submodules",
+    }
+    if "git_metadata_unreadable" in report.get("reasons", []):
+        eligibility = "unknown"
+    elif hardening_reasons.intersection(report.get("reasons", [])):
+        eligibility = "blocked"
+    elif report.get("safe_to_update") is True and relation == "behind":
+        eligibility = "eligible"
+    elif relation == "unknown":
+        eligibility = "unknown"
+    else:
+        eligibility = "blocked"
+
+    reasons = report.setdefault("reasons", [])
+    if report.get("state") == "synced" and "in_sync_no_action" not in reasons:
+        reasons.append("in_sync_no_action")
+    report["relation"] = relation
+    report["eligibility"] = eligibility
+    report["reason_codes"] = list(reasons)
+    return report
+
+
+def _git_topology_reasons(repo: Path, run_git: Any) -> List[str]:
+    """Read fail-closed repository topology metadata without changing Git state."""
+    reasons: List[str] = []
+    unreadable = False
+
+    symbolic_head = run_git(["symbolic-ref", "-q", "HEAD"])
+    if symbolic_head.ok:
+        if not symbolic_head.stdout:
+            unreadable = True
+    elif symbolic_head.returncode == 1:
+        reasons.append("detached_head")
+    else:
+        unreadable = True
+
+    for marker in (
+        "MERGE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD",
+        "REVERT_HEAD", "BISECT_LOG",
+    ):
+        marker_result = run_git(["rev-parse", "--git-path", marker])
+        if not marker_result.ok or not marker_result.stdout:
+            unreadable = True
+            continue
+        marker_path = Path(marker_result.stdout)
+        if not marker_path.is_absolute():
+            marker_path = repo / marker_path
+        try:
+            marker_path.stat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            unreadable = True
+        else:
+            if "operation_in_progress" not in reasons:
+                reasons.append("operation_in_progress")
+
+    shallow = run_git(["rev-parse", "--is-shallow-repository"])
+    if not shallow.ok or shallow.stdout not in {"true", "false"}:
+        unreadable = True
+    elif shallow.stdout == "true":
+        reasons.append("shallow_repository")
+
+    git_dir = run_git(["rev-parse", "--git-dir"])
+    common_dir = run_git(["rev-parse", "--git-common-dir"])
+    if not git_dir.ok or not git_dir.stdout or not common_dir.ok or not common_dir.stdout:
+        unreadable = True
+    else:
+        def normalized(value: str) -> Path:
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                candidate = repo / candidate
+            return candidate.resolve()
+
+        try:
+            if normalized(git_dir.stdout) != normalized(common_dir.stdout):
+                reasons.append("linked_worktree")
+        except OSError:
+            unreadable = True
+
+    superproject = run_git(["rev-parse", "--show-superproject-working-tree"])
+    if not superproject.ok:
+        unreadable = True
+    elif superproject.stdout:
+        reasons.append("submodule_checkout")
+
+    gitmodules = run_git(["ls-files", "--error-unmatch", "--", ".gitmodules"])
+    if gitmodules.ok:
+        if gitmodules.stdout == ".gitmodules":
+            reasons.append("contains_submodules")
+        else:
+            unreadable = True
+    elif gitmodules.returncode != 1:
+        unreadable = True
+
+    gitlinks = run_git(["ls-files", "--stage"])
+    if not gitlinks.ok:
+        unreadable = True
+    elif any(line.startswith("160000 ") for line in gitlinks.stdout.splitlines()):
+        if "contains_submodules" not in reasons:
+            reasons.append("contains_submodules")
+
+    if unreadable:
+        reasons.append("git_metadata_unreadable")
+    return reasons
 
 
 def inspect_project(
@@ -161,13 +368,13 @@ def inspect_project(
     }
     if not repo.exists():
         report["reasons"].append("path_missing")
-        return report
+        return _finalize_report(report)
 
     top = run_git(["rev-parse", "--show-toplevel"])
     if not top.ok:
         report.update(state="not_git", error=top.stderr)
         report["reasons"].append("not_git")
-        return report
+        return _finalize_report(report)
     repo = Path(top.stdout).resolve()
     report.update(path=str(repo), is_git=True)
 
@@ -179,6 +386,12 @@ def inspect_project(
             report["reasons"].append("fetch_failed")
     else:
         report["remote_data"] = "local_tracking_refs"
+
+    topology_reasons = _git_topology_reasons(repo, run_git)
+    if topology_reasons:
+        report["reasons"].extend(topology_reasons)
+        report["state"] = "protected"
+        return _finalize_report(report)
 
     branch = run_git(["branch", "--show-current"])
     head = run_git(["rev-parse", "HEAD"])
@@ -194,7 +407,7 @@ def inspect_project(
         )
         report["reasons"].append("worktree_status_unavailable")
         report["actions"].append("restore_git_status_before_sync")
-        return report
+        return _finalize_report(report)
     dirty_lines = status.stdout.splitlines() if status.stdout else []
     remote_name = run_git(["config", "--get", f"branch.{branch.stdout}.remote"]) if branch.stdout else GitResult(False)
     remote_url = run_git(["remote", "get-url", remote_name.stdout]) if remote_name.ok and remote_name.stdout else GitResult(False)
@@ -210,7 +423,7 @@ def inspect_project(
     if not head.ok:
         report["state"] = "invalid_head"
         report["reasons"].append("invalid_head")
-        return report
+        return _finalize_report(report)
     if dirty_lines:
         report["reasons"].append("dirty_worktree")
         report["actions"].append("preserve_or_commit_local_changes_before_sync")
@@ -218,28 +431,28 @@ def inspect_project(
         report["reasons"].append("missing_upstream")
         report["actions"].append("set_or_confirm_tracking_branch")
         report["state"] = "protected"
-        return report
+        return _finalize_report(report)
 
     counts = run_git(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
     if not counts.ok or not counts.stdout:
         report["reasons"].append("ahead_behind_unavailable")
         report["state"] = "protected"
-        return report
+        return _finalize_report(report)
     parts = counts.stdout.split()
     if len(parts) != 2:
         report["reasons"].append("ahead_behind_unavailable")
         report["state"] = "protected"
-        return report
+        return _finalize_report(report)
     try:
         ahead, behind = (int(parts[0]), int(parts[1]))
     except (TypeError, ValueError):
         report["reasons"].append("ahead_behind_unavailable")
         report["state"] = "protected"
-        return report
+        return _finalize_report(report)
     if ahead < 0 or behind < 0:
         report["reasons"].append("ahead_behind_unavailable")
         report["state"] = "protected"
-        return report
+        return _finalize_report(report)
     report["ahead"] = ahead
     report["behind"] = behind
     ahead, behind = report["ahead"], report["behind"]
@@ -268,7 +481,7 @@ def inspect_project(
     else:
         report["state"] = "synced"
         report["ok"] = True
-    return report
+    return _finalize_report(report)
 
 
 def _event_path(base_dir: Optional[str]) -> Path:
@@ -284,6 +497,46 @@ def _event_path(base_dir: Optional[str]) -> Path:
         state_root = configured_state if configured_state.is_absolute() else Path.home() / ".local" / "state"
         state_dir = state_root / "version-drift"
     return state_dir / "events.jsonl"
+
+
+def _apply_lock_path(path: str, base_dir: Optional[str] = None) -> Path:
+    """Return the state-local lock path for a canonical repository path."""
+    canonical = str(Path(path).expanduser().resolve())
+    lock_name = hashlib.sha256(canonical.encode("utf-8")).hexdigest() + ".lock"
+    return _event_path(base_dir).parent / "locks" / lock_name
+
+
+def _acquire_apply_lock(path: str, base_dir: Optional[str] = None) -> Optional[int]:
+    """Atomically acquire a repository apply lock, or return None if held."""
+    lock_path = _apply_lock_path(path, base_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return None
+    content = json.dumps({
+        "pid": os.getpid(), "created_at": _now(), "path": str(Path(path).resolve()),
+    })
+    try:
+        os.write(descriptor, (content + "\n").encode("utf-8"))
+    except BaseException:
+        _release_apply_lock(lock_path, descriptor)
+        raise
+    return descriptor
+
+
+def _release_apply_lock(lock_path: Path, descriptor: int) -> None:
+    """Release only the lock represented by descriptor."""
+    try:
+        opened = os.fstat(descriptor)
+        try:
+            current = lock_path.stat()
+        except FileNotFoundError:
+            current = None
+        if current is not None and (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino):
+            lock_path.unlink()
+    finally:
+        os.close(descriptor)
 
 
 def _working_content_snapshot(path: Path) -> Tuple[str, List[str], bool]:
@@ -369,10 +622,16 @@ def _working_content_snapshot(path: Path) -> Tuple[str, List[str], bool]:
 def _repository_snapshots(paths: Iterable[Path]) -> Dict[str, Dict[str, Any]]:
     snapshots: Dict[str, Dict[str, Any]] = {}
     for raw_path in paths:
-        path = Path(raw_path).resolve()
-        head = _run_git(path, ["rev-parse", "HEAD"])
-        status = _run_git(path, ["status", "--porcelain=v1", "-uall"])
-        content_fingerprint, content_paths, content_ok = _working_content_snapshot(path)
+        try:
+            path = Path(raw_path).resolve()
+            head = _run_git(path, ["rev-parse", "HEAD"])
+            status = _run_git(path, ["status", "--porcelain=v1", "-uall"])
+            content_fingerprint, content_paths, content_ok = _working_content_snapshot(path)
+        except OSError:
+            path = Path(raw_path).absolute()
+            head = GitResult(False)
+            status = GitResult(False)
+            content_fingerprint, content_paths, content_ok = "", [], False
         snapshots[str(path)] = {
             "head": head.stdout if head.ok else "",
             "status": status.stdout.splitlines() if status.ok and status.stdout else [],
@@ -419,12 +678,24 @@ def _attach_change_measurement(
 
 
 def record_event(report: Dict[str, Any], base_dir: Optional[str] = None, event: str = "scan") -> Dict[str, Any]:
-    payload = dict(report)
-    payload["event"] = event
+    def sanitize(value: Any) -> Any:
+        if isinstance(value, str):
+            return "".join("\ufffd" if 0xD800 <= ord(char) <= 0xDFFF else char for char in value)
+        if isinstance(value, dict):
+            return {sanitize(key): sanitize(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [sanitize(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(sanitize(item) for item in value)
+        return value
+
+    payload = sanitize(dict(report))
+    payload["event"] = sanitize(event)
     path = _event_path(base_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    serialized = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    with path.open("ab") as handle:
+        handle.write(serialized)
     return payload
 
 
@@ -506,15 +777,146 @@ def summarize(reports: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+_INSPECTION_FAILURE_REASONS = {
+    "path_missing", "not_git", "fetch_failed", "git_metadata_unreadable",
+    "worktree_status_unavailable", "invalid_head", "ahead_behind_unavailable",
+    "scope_inspection_failed", "event_write_failed",
+}
+
+
+def _inspection_failed(report: Dict[str, Any]) -> bool:
+    return bool(_INSPECTION_FAILURE_REASONS.intersection(report.get("reasons", [])))
+
+
+def _inspection_outcome(reports: Sequence[Dict[str, Any]]) -> str:
+    failures = sum(_inspection_failed(report) for report in reports)
+    if not failures:
+        return "complete"
+    return "failed" if failures == len(reports) else "partial"
+
+
+def _io_failure_report(path: str, reason: str = "scope_inspection_failed") -> Dict[str, Any]:
+    report = {
+        "schema": "version-drift/1", "checked_at": _now(),
+        "path": str(Path(path).expanduser().absolute()), "exists": False,
+        "is_git": False, "ok": False, "safe_to_update": False,
+        "state": "missing", "reasons": [reason], "actions": [],
+        "working_files_changed": 0,
+    }
+    return _finalize_report(report)
+
+
 def scan_projects(roots: Iterable[str], base_dir: Optional[str] = None, fetch: bool = False, max_depth: int = 5) -> Dict[str, Any]:
     validate_max_depth(max_depth)
-    projects = discover_projects(roots, max_depth=max_depth)
+    root_list = list(roots)
+    scope = _scope_projects(root_list, max_depth, explicit_targets=False)
+    projects = scope.projects
     before = _repository_snapshots(projects)
-    reports = [inspect_project(str(path), fetch=fetch) for path in projects]
+    reports = []
+    for path in projects:
+        try:
+            reports.append(inspect_project(str(path), fetch=fetch))
+        except OSError:
+            reports.append(_io_failure_report(str(path)))
+    reports.extend(_io_failure_report(str(path)) for path in scope.failures)
+    reports.sort(key=lambda report: str(report.get("path", "")))
     for report in reports:
-        record_event(report, base_dir=base_dir, event="scan")
-    result = {"summary": summarize(reports), "projects": reports}
+        try:
+            record_event(report, base_dir=base_dir, event="scan")
+        except (OSError, UnicodeError, ValueError, TypeError):
+            report["ok"] = False
+            if "event_write_failed" not in report["reasons"]:
+                report["reasons"].append("event_write_failed")
+            report["reason_codes"] = list(report["reasons"])
+    result = {
+        "schema": SCAN_SCHEMA,
+        "outcome": _inspection_outcome(reports),
+        "summary": summarize(reports),
+        "projects": reports,
+    }
     return _attach_change_measurement(result, before, _repository_snapshots(projects))
+
+
+def plan_projects(
+    roots: Iterable[str],
+    base_dir: Optional[str] = None,
+    fetch: bool = True,
+    max_depth: int = 5,
+) -> Dict[str, Any]:
+    """Record inspection-only fast-forward decisions without authorizing apply."""
+    validate_max_depth(max_depth)
+    root_list = list(roots)
+    scope = _scope_projects(root_list, max_depth, explicit_targets=False)
+    projects = scope.projects
+    repositories: List[Dict[str, Any]] = []
+    for project in projects:
+        try:
+            report = inspect_project(str(project), fetch=fetch)
+        except OSError:
+            report = _io_failure_report(str(project))
+        eligible = report.get("eligibility") == "eligible"
+        entry = {
+            "path": report.get("path"),
+            "relation": report.get("relation"),
+            "eligibility": report.get("eligibility"),
+            "reason_codes": list(report.get("reason_codes") or []),
+            "planned_action": "fast_forward" if eligible else "none",
+            "evidence": {
+                key: report.get(key)
+                for key in ("head", "upstream", "ahead", "behind", "status_fingerprint")
+            },
+        }
+        repositories.append(entry)
+        try:
+            record_event(
+                {**report, "planned_action": entry["planned_action"]},
+                base_dir=base_dir,
+                event="decision_recorded",
+            )
+        except (OSError, UnicodeError, ValueError, TypeError):
+            entry["eligibility"] = "unknown"
+            entry["planned_action"] = "none"
+            entry["reason_codes"].append("event_write_failed")
+
+    for failed_scope in scope.failures:
+        report = _io_failure_report(str(failed_scope))
+        repositories.append({
+            "path": report["path"], "relation": report["relation"],
+            "eligibility": report["eligibility"],
+            "reason_codes": list(report["reason_codes"]), "planned_action": "none",
+            "evidence": {key: report.get(key) for key in (
+                "head", "upstream", "ahead", "behind", "status_fingerprint"
+            )},
+        })
+    repositories.sort(key=lambda repository: str(repository.get("path", "")))
+
+    planned = sum(item["planned_action"] == "fast_forward" for item in repositories)
+    unknown = sum(item["eligibility"] == "unknown" for item in repositories)
+    blocked = len(repositories) - planned - unknown
+    inspection_failures = sum(
+        bool(_INSPECTION_FAILURE_REASONS.intersection(item["reason_codes"]))
+        for item in repositories
+    )
+    if repositories and inspection_failures == len(repositories):
+        outcome = "failed"
+    elif inspection_failures:
+        outcome = "partial"
+    else:
+        outcome = "complete"
+    return {
+        "schema": PLAN_SCHEMA,
+        "generated_at": _now(),
+        "fetch_performed": bool(fetch),
+        "outcome": outcome,
+        "summary": {
+            "total": len(repositories),
+            "planned": planned,
+            "blocked": blocked,
+            "unknown": unknown,
+        },
+        "repositories": repositories,
+        "authorization": PLAN_AUTHORIZATION,
+    }
 
 
 def is_safe_fast_forward(report: Dict[str, Any]) -> bool:
@@ -536,59 +938,149 @@ def _sync_blocked(report: Dict[str, Any]) -> bool:
 
 
 def sync_project(path: str, base_dir: Optional[str] = None, apply: bool = False, fetch: bool = True) -> Dict[str, Any]:
-    before = inspect_project(path, fetch=fetch)
+    candidate = Path(path).expanduser()
+    if _path_has_symlink_component(candidate):
+        return {
+            "before": _io_failure_report(path), "applied": False, "after": None,
+            "blocked": True, "reason": "scope_inspection_failed",
+        }
+    try:
+        before = inspect_project(path, fetch=fetch)
+    except OSError:
+        before = _io_failure_report(path)
     result: Dict[str, Any] = {"before": before, "applied": False, "after": None}
+
+    def event(report: Dict[str, Any], name: str) -> bool:
+        try:
+            record_event(report, base_dir=base_dir, event=name)
+        except (OSError, UnicodeError, ValueError, TypeError):
+            return False
+        return True
+
     if _sync_blocked(before):
         result.update(blocked=True, reason="only_clean_fast_forward_sync_is_allowed")
-        record_event(before, base_dir=base_dir, event="sync_blocked")
+        if not event(before, "sync_blocked"):
+            result["reason"] = "event_write_failed"
         return result
     if not apply:
         result.update(blocked=False, reason="dry_run_fast_forward_available")
-        record_event(before, base_dir=base_dir, event="sync_dry_run")
+        if not event(before, "sync_dry_run"):
+            result.update(blocked=True, reason="event_write_failed")
         return result
 
-    current = inspect_project(path, fetch=False)
-    if not _same_apply_snapshot(before, current):
-        result.update(blocked=True, reason="state_changed_before_apply", after=current)
-        record_event(current, base_dir=base_dir, event="sync_state_changed")
+    lock_repo = str(before.get("path", path))
+    try:
+        lock_path = _apply_lock_path(lock_repo, base_dir)
+        descriptor = _acquire_apply_lock(lock_repo, base_dir)
+    except OSError:
+        result.update(blocked=True, reason="apply_lock_io_failed")
+        return result
+    if descriptor is None:
+        result.update(blocked=True, reason="apply_lock_held")
+        if not event(before, "sync_blocked"):
+            result["reason"] = "event_write_failed"
         return result
 
-    repo = Path(str(current["path"]))
-    pull = _run_git(repo, ["pull", "--ff-only"], timeout_s=120.0)
-    after = inspect_project(str(repo), fetch=False)
-    result.update(
-        blocked=not pull.ok, after=after,
-        pull={"ok": pull.ok, "stdout": pull.stdout[-1000:], "stderr": pull.stderr[-1000:]},
-        applied=pull.ok and bool(after.get("ok")),
-        reason="fast_forward_applied" if pull.ok and after.get("ok") else "fast_forward_failed",
-    )
-    record_event(after, base_dir=base_dir, event="sync_applied" if result["applied"] else "sync_failed")
-    return result
+    pull_succeeded = False
+    try:
+        try:
+            current = inspect_project(path, fetch=False)
+        except OSError:
+            result.update(blocked=True, reason="state_inspection_failed")
+            return result
+        if not _same_apply_snapshot(before, current):
+            result.update(blocked=True, reason="state_changed_before_apply", after=current)
+            if not event(current, "sync_state_changed"):
+                result["reason"] = "event_write_failed"
+            return result
+
+        repo = Path(str(current["path"]))
+        if not event(current, "apply_started"):
+            result.update(blocked=True, reason="event_write_failed")
+            return result
+        pull = _run_git(repo, ["pull", "--ff-only"], timeout_s=120.0)
+        pull_succeeded = pull.ok
+        pull_payload = {"ok": pull.ok, "stdout": pull.stdout[-1000:], "stderr": pull.stderr[-1000:]}
+        if not pull.ok and not event(current, "apply_failed"):
+            result.update(blocked=True, reason="event_write_failed", pull=pull_payload)
+            return result
+        try:
+            after = inspect_project(str(repo), fetch=False)
+        except OSError:
+            result.update(blocked=True, applied=False, reason="fast_forward_outcome_unknown", pull=pull_payload)
+            return result
+        verified = pull.ok and after.get("state") == "synced" and bool(after.get("ok"))
+        reason = "fast_forward_applied" if verified else (
+            "fast_forward_outcome_unknown" if pull.ok else "fast_forward_failed"
+        )
+        lifecycle = "apply_verified_success" if verified else (
+            "apply_outcome_unknown" if pull.ok else None
+        )
+        if lifecycle and not event(after, lifecycle):
+            result.update(blocked=True, after=after, applied=False,
+                          reason="fast_forward_outcome_unknown", pull=pull_payload)
+            return result
+        result.update(blocked=not verified, after=after, pull=pull_payload,
+                      applied=verified, reason=reason)
+        if not event(after, "sync_applied" if verified else "sync_failed"):
+            result.update(blocked=True, applied=False,
+                          reason="fast_forward_outcome_unknown" if pull.ok else "event_write_failed")
+        return result
+    finally:
+        try:
+            _release_apply_lock(lock_path, descriptor)
+        except OSError:
+            result.update(blocked=True, applied=False,
+                          reason="fast_forward_outcome_unknown" if pull_succeeded else "apply_lock_io_failed")
 
 
 def sync_projects(roots: Iterable[str], base_dir: Optional[str] = None, apply: bool = False, fetch: bool = True, max_depth: int = 5) -> Dict[str, Any]:
     """Preview or apply safe fast-forwards across repositories under roots."""
     validate_max_depth(max_depth)
-    projects = discover_projects(roots, max_depth=max_depth)
+    root_list = list(roots)
+    scope = _scope_projects(root_list, max_depth, explicit_targets=True)
+    projects = scope.projects
     before_snapshots = _repository_snapshots(projects)
     results = [
         sync_project(str(repo), base_dir=base_dir, apply=apply, fetch=fetch)
         for repo in projects
     ]
+    results.extend({
+        "before": _io_failure_report(str(path)), "applied": False, "after": None,
+        "blocked": True, "reason": "scope_inspection_failed",
+    } for path in scope.failures)
+    results.sort(key=lambda item: str(item["before"].get("path", "")))
+    operational_failures = sum(
+        item.get("reason") in {
+            "fast_forward_failed", "fast_forward_outcome_unknown", "apply_lock_io_failed",
+            "event_write_failed", "state_inspection_failed",
+        }
+        or _inspection_failed(item["before"])
+        for item in results
+    )
+    applied = sum(bool(item.get("applied")) for item in results)
+    if not operational_failures:
+        outcome = "complete"
+    elif applied:
+        outcome = "partial"
+    else:
+        outcome = "failed"
     summary = {
         "total": len(results),
         "safe": sum(item["before"].get("state") == "behind_clean" for item in results),
         "protected": sum(item["before"].get("state") not in {"synced", "behind_clean"} for item in results),
         "synced": sum(item["before"].get("state") == "synced" for item in results),
-        "applied": sum(bool(item.get("applied")) for item in results),
-        "failed": sum(item.get("reason") in {"fast_forward_failed", "state_changed_before_apply"} for item in results),
+        "applied": applied,
+        "failed": operational_failures,
+        "outcome": outcome,
         "working_files_changed": 0,
     }
-    result = {"summary": summary, "projects": results}
+    result = {"schema": SYNC_SCHEMA, "outcome": outcome, "summary": summary, "projects": results}
     return _attach_change_measurement(result, before_snapshots, _repository_snapshots(projects))
 
 
 __all__ = [
     "GitResult", "default_roots", "discover_projects", "inspect_project", "is_safe_fast_forward",
-    "history", "record_event", "scan_projects", "summarize", "sync_project", "sync_projects",
+    "history", "plan_projects", "record_event", "scan_projects", "summarize", "sync_project",
+    "sync_projects",
 ]
