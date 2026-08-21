@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing immutable release tag to publish
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -17,6 +23,8 @@ jobs:
       url: https://pypi.org/project/version-drift/
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -25,7 +33,7 @@ jobs:
         run: |
           python - <<'PY'
           import pathlib, re, tomllib
-          tag = "${{ github.ref_name }}"
+          tag = "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
           project = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
           init = pathlib.Path("src/version_drift/__init__.py").read_text()
           runtime = re.search(r'__version__ = "([^"]+)"', init).group(1)
