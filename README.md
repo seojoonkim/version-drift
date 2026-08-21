@@ -49,10 +49,11 @@ python -m pip install -e .
 ## Run your first Git checkup
 
 ```bash
-version-drift scan ~/code --fetch
+version-drift init ~/code ~/work
+version-drift inbox --fetch
 ```
 
-`scan` never modifies working files, the index, local commits, or branches. Without `--fetch`, it compares against local remote-tracking refs. With `--fetch`, it first runs a non-destructive fetch so the comparison is current.
+`init` validates and saves roots without scanning repositories. `inbox` reports only repository states that are new, changed, or resolved since the previous checkup. Both `scan` and `inbox` remain read-only for working files, the index, local commits, and branches. Without `--fetch`, they compare against local remote-tracking refs. With `--fetch`, they first run a non-destructive fetch so the comparison is current.
 
 ## Why VersionDrift?
 
@@ -90,12 +91,24 @@ version-drift scan ~/code ~/work
 - `--check`: return exit code 1 when drift exists
 - `--max-depth N`: bound discovery depth
 
-Set repeatable default roots with your platform path separator:
+Save repeatable default roots:
 
 ```bash
-export VERSION_DRIFT_ROOTS="$HOME/code:$HOME/work"
+version-drift init ~/code ~/work
 version-drift scan
 ```
+
+Root precedence is explicit command-line roots, saved configuration, `VERSION_DRIFT_ROOTS`, then the current directory.
+
+### Show the daily change inbox
+
+```bash
+version-drift inbox
+version-drift inbox --fetch
+version-drift inbox --json
+```
+
+The first check reports every non-synced repository as `new`. Later checks omit unchanged repositories and report only `new`, `changed`, and `resolved` entries.
 
 ### Inspect one repository
 
@@ -127,6 +140,10 @@ Linux: ${XDG_STATE_HOME:-~/.local/state}/version-drift/events.jsonl
 ```
 
 The state file defaults outside your Git repositories, so recording a checkup does not dirty the repository where you invoked VersionDrift. The current schema is `version-drift/1`. Choose another state root with `--base-dir` or `VERSION_DRIFT_DIR`; explicit state roots retain the legacy `.version-drift/events.jsonl` suffix for compatibility.
+
+The latest inbox snapshot is written atomically beside the event file as `inbox_snapshot.json`. It contains local repository paths and Git state, stays on the machine, and is never written into a scanned repository. A corrupt snapshot is preserved and causes a fail-closed error instead of silently resetting the baseline.
+
+Root configuration is stored outside repositories at `~/Library/Application Support/VersionDrift/config.toml` on macOS or `${XDG_CONFIG_HOME:-~/.config}/version-drift/config.toml` on Linux.
 
 `Working files changed` is measured from repository HEAD and worktree snapshots taken before and after the command. A read-only scan should report `0`; an applied fast-forward reports the files changed by the accepted upstream commits.
 

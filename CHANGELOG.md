@@ -2,6 +2,18 @@
 
 All notable changes to VersionDrift are documented here.
 
+## [0.3.0] - 2026-08-21
+
+### Added
+
+- `version-drift init` for deterministic platform-local root configuration without scanning repositories.
+- `version-drift inbox` for new, changed, and resolved repository drift since the previous checkup.
+- Atomic inbox snapshots and machine-readable inbox JSON.
+
+### Changed
+
+- Argument-free scans resolve roots from saved configuration before `VERSION_DRIFT_ROOTS` and the current directory.
+
 ## [0.2.1] - 2026-08-21
 
 ### Fixed
