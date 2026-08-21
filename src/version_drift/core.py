@@ -36,12 +36,21 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _run_git(repo: Path, args: Sequence[str], timeout_s: float = 20.0) -> GitResult:
+def _run_git(
+    repo: Path,
+    args: Sequence[str],
+    timeout_s: float = 20.0,
+    optional_locks: bool = True,
+) -> GitResult:
+    env = None
+    if not optional_locks:
+        env = os.environ.copy()
+        env["GIT_OPTIONAL_LOCKS"] = "0"
     try:
         proc = subprocess.run(
             ["git", "-C", str(repo), *args], text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=timeout_s, check=False,
+            timeout=timeout_s, check=False, env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return GitResult(False, stderr=str(exc), returncode=124)
@@ -100,9 +109,18 @@ def _fingerprint(lines: Sequence[str]) -> str:
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
-def inspect_project(path: str, fetch: bool = False) -> Dict[str, Any]:
-    """Return a normalized, non-destructive drift report for one repository."""
+def inspect_project(
+    path: str,
+    fetch: bool = False,
+    optional_locks: bool = True,
+) -> Dict[str, Any]:
+    """Return a normalized drift report, optionally suppressing Git index refreshes."""
     repo = Path(path).expanduser().resolve()
+
+    def run_git(args: Sequence[str], timeout_s: float = 20.0) -> GitResult:
+        if optional_locks:
+            return _run_git(repo, args, timeout_s=timeout_s)
+        return _run_git(repo, args, timeout_s=timeout_s, optional_locks=False)
     report: Dict[str, Any] = {
         "schema": "version-drift/1", "checked_at": _now(), "path": str(repo),
         "exists": repo.exists(), "is_git": False, "ok": False,
@@ -113,7 +131,7 @@ def inspect_project(path: str, fetch: bool = False) -> Dict[str, Any]:
         report["reasons"].append("path_missing")
         return report
 
-    top = _run_git(repo, ["rev-parse", "--show-toplevel"])
+    top = run_git(["rev-parse", "--show-toplevel"])
     if not top.ok:
         report.update(state="not_git", error=top.stderr)
         report["reasons"].append("not_git")
@@ -122,7 +140,7 @@ def inspect_project(path: str, fetch: bool = False) -> Dict[str, Any]:
     report.update(path=str(repo), is_git=True)
 
     if fetch:
-        fetched = _run_git(repo, ["fetch", "--prune", "--tags"], timeout_s=60.0)
+        fetched = run_git(["fetch", "--prune", "--tags"], timeout_s=60.0)
         report["fetch"] = {"ok": fetched.ok, "stderr": fetched.stderr[-500:]}
         report["remote_data"] = "fetched_now" if fetched.ok else "fetch_failed"
         if not fetched.ok:
@@ -130,10 +148,10 @@ def inspect_project(path: str, fetch: bool = False) -> Dict[str, Any]:
     else:
         report["remote_data"] = "local_tracking_refs"
 
-    branch = _run_git(repo, ["branch", "--show-current"])
-    head = _run_git(repo, ["rev-parse", "HEAD"])
-    upstream = _run_git(repo, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
-    status = _run_git(repo, ["status", "--porcelain=v1", "-uall"])
+    branch = run_git(["branch", "--show-current"])
+    head = run_git(["rev-parse", "HEAD"])
+    upstream = run_git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
+    status = run_git(["status", "--porcelain=v1", "-uall"])
     if not status.ok:
         report.update(
             branch=branch.stdout,
@@ -146,8 +164,8 @@ def inspect_project(path: str, fetch: bool = False) -> Dict[str, Any]:
         report["actions"].append("restore_git_status_before_sync")
         return report
     dirty_lines = status.stdout.splitlines() if status.stdout else []
-    remote_name = _run_git(repo, ["config", "--get", f"branch.{branch.stdout}.remote"]) if branch.stdout else GitResult(False)
-    remote_url = _run_git(repo, ["remote", "get-url", remote_name.stdout]) if remote_name.ok and remote_name.stdout else GitResult(False)
+    remote_name = run_git(["config", "--get", f"branch.{branch.stdout}.remote"]) if branch.stdout else GitResult(False)
+    remote_url = run_git(["remote", "get-url", remote_name.stdout]) if remote_name.ok and remote_name.stdout else GitResult(False)
     report.update(
         branch=branch.stdout, head=head.stdout, upstream=upstream.stdout if upstream.ok else "",
         remote_name=remote_name.stdout if remote_name.ok else "",
@@ -170,7 +188,7 @@ def inspect_project(path: str, fetch: bool = False) -> Dict[str, Any]:
         report["state"] = "protected"
         return report
 
-    counts = _run_git(repo, ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
+    counts = run_git(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
     if not counts.ok or not counts.stdout:
         report["reasons"].append("ahead_behind_unavailable")
         report["state"] = "protected"
@@ -326,20 +344,28 @@ def scan_projects(roots: Iterable[str], base_dir: Optional[str] = None, fetch: b
     return _attach_change_measurement(result, before, _repository_snapshots(projects))
 
 
+def is_safe_fast_forward(report: Dict[str, Any]) -> bool:
+    """Return whether the normalized report meets the public sync policy."""
+    return report.get("state") == "behind_clean" and report.get("safe_to_update") is True
+
+
 def _same_apply_snapshot(before: Dict[str, Any], current: Dict[str, Any]) -> bool:
     return (
-        current.get("state") == "behind_clean"
-        and current.get("safe_to_update") is True
+        is_safe_fast_forward(current)
         and current.get("head") == before.get("head")
         and current.get("status_fingerprint") == before.get("status_fingerprint")
         and current.get("upstream") == before.get("upstream")
     )
 
 
+def _sync_blocked(report: Dict[str, Any]) -> bool:
+    return not is_safe_fast_forward(report)
+
+
 def sync_project(path: str, base_dir: Optional[str] = None, apply: bool = False, fetch: bool = True) -> Dict[str, Any]:
     before = inspect_project(path, fetch=fetch)
     result: Dict[str, Any] = {"before": before, "applied": False, "after": None}
-    if before.get("state") != "behind_clean" or not before.get("safe_to_update"):
+    if _sync_blocked(before):
         result.update(blocked=True, reason="only_clean_fast_forward_sync_is_allowed")
         record_event(before, base_dir=base_dir, event="sync_blocked")
         return result
@@ -389,6 +415,6 @@ def sync_projects(roots: Iterable[str], base_dir: Optional[str] = None, apply: b
 
 
 __all__ = [
-    "GitResult", "default_roots", "discover_projects", "inspect_project", "record_event",
-    "scan_projects", "summarize", "sync_project", "sync_projects",
+    "GitResult", "default_roots", "discover_projects", "inspect_project", "is_safe_fast_forward",
+    "record_event", "scan_projects", "summarize", "sync_project", "sync_projects",
 ]

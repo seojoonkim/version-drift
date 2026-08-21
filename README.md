@@ -110,6 +110,17 @@ version-drift inbox --json
 
 The first check reports every non-synced repository as `new`. Later checks omit unchanged repositories and report only `new`, `changed`, and `resolved` entries.
 
+### Explain repository states
+
+```bash
+version-drift explain
+version-drift explain ~/code/project --json
+```
+
+`explain` reuses the existing local inspection contract and translates each state into a reason, impact, and safe next action. With explicit paths it explains exactly those paths; without paths it discovers repositories under the configured roots. Its JSON schema is `version-drift/explain/1`.
+
+`explain` never fetches, changes Git state, records an event, or updates the inbox snapshot. Only `behind_clean` repositories are marked `sync_eligible`, using the same predicate as `sync`.
+
 ### Inspect one repository
 
 ```bash

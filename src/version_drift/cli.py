@@ -10,7 +10,8 @@ from typing import Any, Optional, Sequence
 
 from . import __version__
 from .config import config_path, resolve_roots, write_config
-from .core import inspect_project, record_event, scan_projects, sync_projects
+from .core import discover_projects, inspect_project, record_event, scan_projects, sync_projects
+from .explain import explain_reports
 from .inbox import build_inbox
 
 
@@ -47,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
     inbox.add_argument("--max-depth", type=int, default=5)
     inbox.add_argument("--fetch", action="store_true")
     inbox.add_argument("--json", action="store_true")
+
+    explain = sub.add_parser("explain", help="Explain repository states and safe next actions")
+    explain.add_argument("paths", nargs="*", help="Repositories to explain; defaults to configured roots")
+    explain.add_argument("--max-depth", type=int, default=5)
+    explain.add_argument("--json", action="store_true")
 
     inspect = sub.add_parser("inspect", help="Inspect one Git repository")
     inspect.add_argument("path")
@@ -141,6 +147,26 @@ def _print_inbox(result: dict[str, Any]) -> None:
     print(f"Working files changed: {result['scan_summary']['working_files_changed']}")
 
 
+def _print_explain(result: dict[str, Any]) -> None:
+    summary = result["summary"]
+    total = summary["total"]
+    noun = "repository" if total == 1 else "repositories"
+    print(f"VersionDrift explain: {total} {noun}")
+    for item in result["repositories"]:
+        detail = item["state"]
+        if item.get("behind"):
+            detail += f" ({item['behind']} commits behind)"
+        elif item.get("ahead"):
+            detail += f" ({item['ahead']} commits ahead)"
+        print(f"\n{item['path']}\n  State: {detail}")
+        print(f"  Why: {item['why_it_matters']}")
+        for action in item["safe_actions"]:
+            print(f"  Next: {action['description']}")
+            if action.get("command"):
+                print(f"        {action['command']}")
+    print("\nNothing was changed.")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     base_dir = args.base_dir or None
@@ -176,6 +202,32 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         else:
             _print_inbox(result)
+        return 0
+    if args.command == "explain":
+        if args.max_depth < 0:
+            print("version-drift explain: max depth must be non-negative", file=sys.stderr)
+            return 2
+        try:
+            if args.paths:
+                projects = sorted(
+                    {Path(path).expanduser().resolve() for path in args.paths},
+                    key=str,
+                )
+            else:
+                roots = resolve_roots([])
+                projects = discover_projects(roots, max_depth=args.max_depth)
+            reports = [
+                inspect_project(str(path), fetch=False, optional_locks=False)
+                for path in projects
+            ]
+            result = explain_reports(reports)
+        except (OSError, ValueError) as exc:
+            print(f"version-drift explain: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        else:
+            _print_explain(result)
         return 0
     if args.command == "inspect":
         report = inspect_project(args.path, fetch=args.fetch)

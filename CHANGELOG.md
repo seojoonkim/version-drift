@@ -2,6 +2,17 @@
 
 All notable changes to VersionDrift are documented here.
 
+## [0.4.0] - 2026-08-21
+
+### Added
+
+- `version-drift explain` for deterministic, read-only reasons and safe next actions per repository.
+- Machine-readable `version-drift/explain/1` output with state counts and shared sync eligibility.
+
+### Changed
+
+- The clean fast-forward predicate is shared by `explain` and `sync`, preventing policy drift.
+
 ## [0.3.0] - 2026-08-21
 
 ### Added

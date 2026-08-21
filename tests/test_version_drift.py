@@ -426,4 +426,4 @@ def test_cli_version_falls_back_to_source_version_without_distribution_metadata(
     except SystemExit as exc:
         assert exc.code == 0
 
-    assert capsys.readouterr().out.strip() == "version-drift 0.3.0"
+    assert capsys.readouterr().out.strip() == "version-drift 0.4.0"
