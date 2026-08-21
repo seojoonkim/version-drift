@@ -60,6 +60,8 @@ def load_snapshot(path: Path) -> Optional[Dict[str, Any]]:
 def build_inbox(
     roots: Iterable[str], base_dir: Optional[str] = None, fetch: bool = False, max_depth: int = 5
 ) -> Dict[str, Any]:
+    if max_depth < 0:
+        raise ValueError("max depth must be non-negative")
     resolved_roots = [str(Path(root).expanduser().resolve()) for root in roots]
     path = snapshot_path(base_dir)
     previous = load_snapshot(path)

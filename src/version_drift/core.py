@@ -9,8 +9,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
+import stat
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +25,13 @@ SKIP_DIR_NAMES = {
     "site-packages", "vendor",
 }
 _EVENT_STORE = ".version-drift/events.jsonl"
+HISTORY_SCHEMA = "version-drift/history/1"
+
+
+def validate_max_depth(max_depth: int) -> int:
+    if max_depth < 0:
+        raise ValueError("max depth must be non-negative")
+    return max_depth
 
 
 @dataclass(frozen=True)
@@ -40,7 +50,7 @@ def _run_git(
     repo: Path,
     args: Sequence[str],
     timeout_s: float = 20.0,
-    optional_locks: bool = True,
+    optional_locks: bool = False,
 ) -> GitResult:
     env = None
     if not optional_locks:
@@ -50,7 +60,7 @@ def _run_git(
         proc = subprocess.run(
             ["git", "-C", str(repo), *args], text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=timeout_s, check=False, env=env,
+            timeout=timeout_s, check=False, env=env, errors="surrogateescape",
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return GitResult(False, stderr=str(exc), returncode=124)
@@ -64,14 +74,34 @@ def default_roots() -> List[str]:
     return [str(Path.cwd().resolve())]
 
 
+def _path_has_symlink_component(path: Path) -> bool:
+    """Return whether an existing component of path is a symbolic link."""
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        try:
+            if stat.S_ISLNK(current.lstat().st_mode):
+                return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+    return False
+
+
 def discover_projects(roots: Iterable[str], max_depth: int = 5) -> List[Path]:
     """Find Git worktrees under explicit roots without following hidden caches."""
+    validate_max_depth(max_depth)
     found: List[Path] = []
     seen: set[Path] = set()
     for raw_root in roots:
         if not raw_root:
             continue
-        root = Path(raw_root).expanduser().resolve()
+        candidate = Path(raw_root).expanduser()
+        if _path_has_symlink_component(candidate):
+            continue
+        root = candidate.resolve()
         if not root.exists():
             continue
         stack: List[Tuple[Path, int]] = [(root, 0)]
@@ -80,6 +110,8 @@ def discover_projects(roots: Iterable[str], max_depth: int = 5) -> List[Path]:
             try:
                 real = current.resolve()
             except OSError:
+                continue
+            if current.is_symlink():
                 continue
             if real in seen:
                 continue
@@ -112,15 +144,15 @@ def _fingerprint(lines: Sequence[str]) -> str:
 def inspect_project(
     path: str,
     fetch: bool = False,
-    optional_locks: bool = True,
+    optional_locks: bool = False,
 ) -> Dict[str, Any]:
     """Return a normalized drift report, optionally suppressing Git index refreshes."""
     repo = Path(path).expanduser().resolve()
 
     def run_git(args: Sequence[str], timeout_s: float = 20.0) -> GitResult:
         if optional_locks:
-            return _run_git(repo, args, timeout_s=timeout_s)
-        return _run_git(repo, args, timeout_s=timeout_s, optional_locks=False)
+            return _run_git(repo, args, timeout_s=timeout_s, optional_locks=True)
+        return _run_git(repo, args, timeout_s=timeout_s)
     report: Dict[str, Any] = {
         "schema": "version-drift/1", "checked_at": _now(), "path": str(repo),
         "exists": repo.exists(), "is_git": False, "ok": False,
@@ -194,8 +226,22 @@ def inspect_project(
         report["state"] = "protected"
         return report
     parts = counts.stdout.split()
-    report["ahead"] = int(parts[0])
-    report["behind"] = int(parts[1])
+    if len(parts) != 2:
+        report["reasons"].append("ahead_behind_unavailable")
+        report["state"] = "protected"
+        return report
+    try:
+        ahead, behind = (int(parts[0]), int(parts[1]))
+    except (TypeError, ValueError):
+        report["reasons"].append("ahead_behind_unavailable")
+        report["state"] = "protected"
+        return report
+    if ahead < 0 or behind < 0:
+        report["reasons"].append("ahead_behind_unavailable")
+        report["state"] = "protected"
+        return report
+    report["ahead"] = ahead
+    report["behind"] = behind
     ahead, behind = report["ahead"], report["behind"]
 
     if "fetch_failed" in report["reasons"]:
@@ -241,9 +287,49 @@ def _event_path(base_dir: Optional[str]) -> Path:
 
 
 def _working_content_snapshot(path: Path) -> Tuple[str, List[str], bool]:
-    diff = _run_git(path, ["diff", "--binary", "HEAD", "--"])
-    tracked_names = _run_git(path, ["diff", "--name-only", "HEAD", "--"])
-    untracked_names = _run_git(path, ["ls-files", "--others", "--exclude-standard"])
+    index = _run_git(path, ["rev-parse", "--git-path", "index"])
+    if not index.ok or not index.stdout:
+        return "", [], False
+    index_path = Path(index.stdout)
+    if not index_path.is_absolute():
+        index_path = path / index_path
+    if not index_path.is_file():
+        return "", [], False
+    file_descriptor, isolated_name = tempfile.mkstemp(prefix="version-drift-index-")
+    os.close(file_descriptor)
+    isolated_index = Path(isolated_name)
+    try:
+        shutil.copyfile(index_path, isolated_index)
+        env = os.environ.copy()
+        env["GIT_OPTIONAL_LOCKS"] = "0"
+        env["GIT_INDEX_FILE"] = str(isolated_index)
+
+        def isolated_git(args: Sequence[str]) -> GitResult:
+            try:
+                proc = subprocess.run(
+                    ["git", "-C", str(path), *args],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=20.0,
+                    check=False,
+                    env=env,
+                    errors="surrogateescape",
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return GitResult(False, stderr=str(exc), returncode=124)
+            return GitResult(
+                proc.returncode == 0,
+                proc.stdout.strip(),
+                proc.stderr.strip(),
+                proc.returncode,
+            )
+
+        diff = isolated_git(["diff", "--binary", "HEAD", "--"])
+        tracked_names = isolated_git(["diff", "--name-only", "HEAD", "--"])
+        untracked_names = isolated_git(["ls-files", "--others", "--exclude-standard"])
+    finally:
+        isolated_index.unlink(missing_ok=True)
     if not diff.ok or not tracked_names.ok or not untracked_names.ok:
         return "", [], False
     names = sorted(set(tracked_names.stdout.splitlines()) | set(untracked_names.stdout.splitlines()))
@@ -251,7 +337,30 @@ def _working_content_snapshot(path: Path) -> Tuple[str, List[str], bool]:
     for name in untracked_names.stdout.splitlines():
         digest.update(name.encode("utf-8", errors="surrogateescape"))
         try:
-            digest.update((path / name).read_bytes())
+            target = path / name
+            info = target.lstat()
+            if target.is_symlink():
+                digest.update(os.readlink(target).encode("utf-8", errors="surrogateescape"))
+            elif stat.S_ISREG(info.st_mode):
+                nofollow = getattr(os, "O_NOFOLLOW", None)
+                nonblock = getattr(os, "O_NONBLOCK", None)
+                if nofollow is None or nonblock is None:
+                    return "", names, False
+                flags = os.O_RDONLY | nofollow | nonblock
+                descriptor = os.open(target, flags)
+                try:
+                    opened = os.fstat(descriptor)
+                    if not stat.S_ISREG(opened.st_mode):
+                        return "", names, False
+                    while True:
+                        chunk = os.read(descriptor, 1024 * 1024)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                finally:
+                    os.close(descriptor)
+            else:
+                digest.update(b"<unsupported>")
         except OSError:
             return "", names, False
     return digest.hexdigest(), names, True
@@ -319,6 +428,69 @@ def record_event(report: Dict[str, Any], base_dir: Optional[str] = None, event: 
     return payload
 
 
+_HISTORY_FIELDS = (
+    "event", "checked_at", "path", "state", "branch", "head", "upstream",
+    "ahead", "behind", "reasons", "actions", "ok", "safe_to_update",
+    "remote_data", "working_files_changed",
+)
+
+
+def history(
+    paths: Optional[Iterable[str]] = None,
+    base_dir: Optional[str] = None,
+    limit: int = 0,
+    events: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    """Read the append-only event trail without changing it or invoking Git."""
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
+    source = _event_path(base_dir)
+    roots = [Path(path).expanduser().resolve() for path in paths or []]
+    types = sorted(set(events or []))
+    result: Dict[str, Any] = {
+        "schema": HISTORY_SCHEMA,
+        "source": str(source),
+        "source_exists": source.is_file(),
+        "filters": {"paths": [str(root) for root in roots], "events": types, "limit": limit},
+        "counts": {"source_lines": 0, "malformed_lines": 0, "matched": 0, "returned": 0},
+        "malformed_lines": 0,
+        "events": [],
+    }
+    if not result["source_exists"]:
+        return result
+    matched: List[Dict[str, Any]] = []
+    with source.open("rb") as handle:
+        for sequence, raw_line in enumerate(handle, start=1):
+            result["counts"]["source_lines"] += 1
+            try:
+                line = raw_line.decode("utf-8")
+                item = json.loads(line)
+                if not isinstance(item, dict):
+                    raise ValueError("event must be an object")
+            except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                result["counts"]["malformed_lines"] += 1
+                continue
+            item_path = item.get("path")
+            resolved = Path(item_path).expanduser().resolve() if isinstance(item_path, str) else None
+            if types and item.get("event") not in types:
+                continue
+            if roots and (
+                resolved is None
+                or not any(resolved == root or root in resolved.parents for root in roots)
+            ):
+                continue
+            matched.append({
+                "sequence": sequence,
+                **{field: item.get(field) for field in _HISTORY_FIELDS},
+            })
+    result["counts"]["matched"] = len(matched)
+    newest = list(reversed(matched))
+    result["events"] = newest if limit == 0 else newest[:limit]
+    result["counts"]["returned"] = len(result["events"])
+    result["malformed_lines"] = result["counts"]["malformed_lines"]
+    return result
+
+
 def summarize(reports: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     states: Dict[str, int] = {}
     for report in reports:
@@ -335,6 +507,7 @@ def summarize(reports: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def scan_projects(roots: Iterable[str], base_dir: Optional[str] = None, fetch: bool = False, max_depth: int = 5) -> Dict[str, Any]:
+    validate_max_depth(max_depth)
     projects = discover_projects(roots, max_depth=max_depth)
     before = _repository_snapshots(projects)
     reports = [inspect_project(str(path), fetch=fetch) for path in projects]
@@ -395,6 +568,7 @@ def sync_project(path: str, base_dir: Optional[str] = None, apply: bool = False,
 
 def sync_projects(roots: Iterable[str], base_dir: Optional[str] = None, apply: bool = False, fetch: bool = True, max_depth: int = 5) -> Dict[str, Any]:
     """Preview or apply safe fast-forwards across repositories under roots."""
+    validate_max_depth(max_depth)
     projects = discover_projects(roots, max_depth=max_depth)
     before_snapshots = _repository_snapshots(projects)
     results = [
@@ -416,5 +590,5 @@ def sync_projects(roots: Iterable[str], base_dir: Optional[str] = None, apply: b
 
 __all__ = [
     "GitResult", "default_roots", "discover_projects", "inspect_project", "is_safe_fast_forward",
-    "record_event", "scan_projects", "summarize", "sync_project", "sync_projects",
+    "history", "record_event", "scan_projects", "summarize", "sync_project", "sync_projects",
 ]

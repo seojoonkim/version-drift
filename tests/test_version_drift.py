@@ -2,6 +2,8 @@ import json
 import subprocess
 import sys
 from importlib import metadata
+
+import pytest
 from pathlib import Path
 
 import version_drift.core as core
@@ -59,6 +61,51 @@ def test_default_roots_uses_version_drift_env(monkeypatch, tmp_path):
     monkeypatch.setenv("MEMKRAFT_PROJECT_SYNC_ROOTS", "/must/not/be/used")
 
     assert core.default_roots() == [str(one), str(two)]
+
+
+def test_history_reads_events_newest_first_and_filters_components(tmp_path):
+    state = tmp_path / "state"
+    event_file = state / ".version-drift" / "events.jsonl"
+    event_file.parent.mkdir(parents=True)
+    event_file.write_text(
+        json.dumps({"event": "scan", "path": str(tmp_path / "a"), "state": "synced"}) + "\n"
+        + "blank\n\n"
+        + json.dumps({"event": "sync_applied", "path": str(tmp_path / "ab"), "state": "behind_clean"}) + "\n",
+        encoding="utf-8",
+    )
+    result = core.history(base_dir=str(state), paths=[str(tmp_path / "a")], limit=0)
+    assert result["schema"] == "version-drift/history/1"
+    assert result["source_exists"] is True
+    assert result["malformed_lines"] == 2
+    assert [item["event"] for item in result["events"]] == ["scan"]
+    assert result["events"][0]["sequence"] == 1
+
+
+def test_history_missing_file_and_negative_limit(tmp_path):
+    result = core.history(base_dir=str(tmp_path / "missing"))
+    assert result["source_exists"] is False and result["events"] == []
+    with pytest.raises(ValueError):
+        core.history(base_dir=str(tmp_path), limit=-1)
+
+
+def test_discovery_does_not_follow_directory_symlinks(tmp_path):
+    inside = tmp_path / "inside"
+    outside = tmp_path / "outside"
+    inside.mkdir()
+    outside.mkdir()
+    _init_repo(outside / "repo")
+    (inside / "escape").symlink_to(outside, target_is_directory=True)
+    assert core.discover_projects([str(inside)]) == []
+
+
+def test_negative_depth_rejected_by_public_apis(tmp_path):
+    for call in (
+        lambda: core.discover_projects([str(tmp_path)], -1),
+        lambda: core.scan_projects([str(tmp_path)], max_depth=-1),
+        lambda: core.sync_projects([str(tmp_path)], max_depth=-1),
+    ):
+        with pytest.raises(ValueError):
+            call()
 
 
 def test_inspect_and_event_store(tmp_path):
@@ -426,4 +473,4 @@ def test_cli_version_falls_back_to_source_version_without_distribution_metadata(
     except SystemExit as exc:
         assert exc.code == 0
 
-    assert capsys.readouterr().out.strip() == "version-drift 0.4.0"
+    assert capsys.readouterr().out.strip() == "version-drift 0.5.0"

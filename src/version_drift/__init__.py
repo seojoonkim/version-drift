@@ -3,6 +3,7 @@
 from .core import (
     default_roots,
     discover_projects,
+    history,
     inspect_project,
     record_event,
     scan_projects,
@@ -14,6 +15,7 @@ from .core import (
 __all__ = [
     "default_roots",
     "discover_projects",
+    "history",
     "inspect_project",
     "record_event",
     "scan_projects",
@@ -21,4 +23,4 @@ __all__ = [
     "sync_project",
     "sync_projects",
 ]
-__version__ = "0.4.0"
+__version__ = "0.5.0"
