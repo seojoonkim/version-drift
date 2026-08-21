@@ -5,6 +5,7 @@ from .core import (
     discover_projects,
     history,
     inspect_project,
+    plan_projects,
     record_event,
     scan_projects,
     summarize,
@@ -17,10 +18,11 @@ __all__ = [
     "discover_projects",
     "history",
     "inspect_project",
+    "plan_projects",
     "record_event",
     "scan_projects",
     "summarize",
     "sync_project",
     "sync_projects",
 ]
-__version__ = "0.5.0"
+__version__ = "1.0.0"

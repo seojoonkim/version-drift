@@ -1,0 +1,5 @@
+include README.md
+include CHANGELOG.md
+include COMPATIBILITY.md
+include THREAT_MODEL.md
+include docs/OPERATIONS.md
