@@ -121,6 +121,18 @@ version-drift explain ~/code/project --json
 
 `explain` never fetches, changes Git state, records an event, or updates the inbox snapshot. Only `behind_clean` repositories are marked `sync_eligible`, using the same predicate as `sync`.
 
+### Read the local decision history
+
+```bash
+version-drift history
+version-drift history ~/code/project --event scan --limit 20
+version-drift history --json
+```
+
+`history` reads the append-only local event trail newest-first. Optional repository paths match only that path and its descendants, `--event` is repeatable, and `--limit 0` keeps all matching events. Its JSON schema is `version-drift/history/1` and includes source, filter, malformed-line, matched, and returned counts.
+
+`history` never invokes Git, fetches, records an event, updates the inbox snapshot, or creates a missing state directory. A torn or malformed event line is counted and skipped, while an unreadable event file fails cleanly without changing it.
+
 ### Inspect one repository
 
 ```bash
@@ -156,7 +168,7 @@ The latest inbox snapshot is written atomically beside the event file as `inbox_
 
 Root configuration is stored outside repositories at `~/Library/Application Support/VersionDrift/config.toml` on macOS or `${XDG_CONFIG_HOME:-~/.config}/version-drift/config.toml` on Linux.
 
-`Working files changed` is measured from repository HEAD and worktree snapshots taken before and after the command. A read-only scan should report `0`; an applied fast-forward reports the files changed by the accepted upstream commits.
+`Working files changed` is measured from repository HEAD and worktree snapshots taken before and after the command. Read-only inspection uses a temporary copy of the Git index, ignores non-regular untracked files, and records symlink targets without dereferencing them. A read-only scan should report `0`; an applied fast-forward reports the files changed by the accepted upstream commits.
 
 VersionDrift sends no telemetry and never uploads repository paths, remotes, or results.
 

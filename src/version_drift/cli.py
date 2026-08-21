@@ -10,7 +10,7 @@ from typing import Any, Optional, Sequence
 
 from . import __version__
 from .config import config_path, resolve_roots, write_config
-from .core import discover_projects, inspect_project, record_event, scan_projects, sync_projects
+from .core import discover_projects, history, inspect_project, record_event, scan_projects, sync_projects
 from .explain import explain_reports
 from .inbox import build_inbox
 
@@ -53,6 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
     explain.add_argument("paths", nargs="*", help="Repositories to explain; defaults to configured roots")
     explain.add_argument("--max-depth", type=int, default=5)
     explain.add_argument("--json", action="store_true")
+
+    history_parser = sub.add_parser("history", help="Read the local decision history")
+    history_parser.add_argument("paths", nargs="*")
+    history_parser.add_argument("--limit", type=int, default=0)
+    history_parser.add_argument("--event", action="append", default=[])
+    history_parser.add_argument("--json", action="store_true")
 
     inspect = sub.add_parser("inspect", help="Inspect one Git repository")
     inspect.add_argument("path")
@@ -167,9 +173,23 @@ def _print_explain(result: dict[str, Any]) -> None:
     print("\nNothing was changed.")
 
 
+def _print_history(result: dict[str, Any]) -> None:
+    print(f"VersionDrift history: {result['counts']['returned']} event(s)")
+    for item in result["events"]:
+        print(f"  {item['sequence']}. {item.get('event')}: {item.get('path')}")
+    malformed = result["counts"]["malformed_lines"]
+    if malformed:
+        noun = "line" if malformed == 1 else "lines"
+        print(f"Skipped {malformed} malformed event {noun}.")
+    print("Nothing was changed.")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     base_dir = args.base_dir or None
+    if hasattr(args, "max_depth") and args.max_depth < 0:
+        print(f"version-drift {args.command}: max depth must be non-negative", file=sys.stderr)
+        return 2
     if args.command == "init":
         try:
             roots = write_config(args.roots)
@@ -204,9 +224,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             _print_inbox(result)
         return 0
     if args.command == "explain":
-        if args.max_depth < 0:
-            print("version-drift explain: max depth must be non-negative", file=sys.stderr)
-            return 2
         try:
             if args.paths:
                 projects = sorted(
@@ -228,6 +245,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         else:
             _print_explain(result)
+        return 0
+    if args.command == "history":
+        try:
+            result = history(args.paths, base_dir=base_dir, limit=args.limit, events=args.event)
+        except OSError as exc:
+            print(f"version-drift history: {exc}", file=sys.stderr)
+            return 1
+        except ValueError as exc:
+            print(f"version-drift history: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        else:
+            _print_history(result)
         return 0
     if args.command == "inspect":
         report = inspect_project(args.path, fetch=args.fetch)

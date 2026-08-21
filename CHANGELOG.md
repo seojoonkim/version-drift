@@ -2,6 +2,25 @@
 
 All notable changes to VersionDrift are documented here.
 
+## [0.5.0] - 2026-08-22
+
+### Added
+
+- `version-drift history` for bounded, newest-first, read-only access to the local decision trail.
+- Machine-readable `version-drift/history/1` output with path and event filters plus source, malformed, matched, and returned counts.
+
+### Fixed
+
+- Reject negative discovery depths consistently in the CLI and public APIs.
+- Refuse explicit symlink roots and avoid dereferencing directory symlinks, external file symlinks, FIFOs, and other special untracked files.
+- Treat malformed or negative Git ahead/behind counts as unavailable and fail closed.
+- Preserve the real Git index bytes and timestamp during inspection by calculating worktree snapshots against an isolated temporary index.
+- Decode unusual Git path bytes without crashing the inspection process.
+
+### Changed
+
+- Shared Git execution and depth validation now enforce the same read-only and fail-closed behavior across scan, inbox, explain, and sync observation paths.
+
 ## [0.4.0] - 2026-08-21
 
 ### Added
