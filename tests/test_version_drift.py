@@ -1,5 +1,7 @@
 import json
 import subprocess
+import sys
+from importlib import metadata
 from pathlib import Path
 
 import version_drift.core as core
@@ -68,6 +70,70 @@ def test_inspect_and_event_store(tmp_path):
     event = record_event(report, base_dir=str(tmp_path / "state"), event="inspect")
     assert event["event"] == "inspect"
     assert (tmp_path / "state" / ".version-drift" / "events.jsonl").exists()
+
+
+def test_default_event_store_is_outside_the_current_git_repository(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    home = tmp_path / "home"
+    _init_repo(repo)
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("VERSION_DRIFT_DIR", raising=False)
+
+    report = inspect_project(str(repo))
+    record_event(report, event="inspect")
+
+    assert not (repo / ".version-drift").exists()
+    if sys.platform == "darwin":
+        expected = home / "Library" / "Application Support" / "VersionDrift" / "events.jsonl"
+    else:
+        expected = home / ".local" / "state" / "version-drift" / "events.jsonl"
+    assert expected.exists()
+
+
+def test_scan_measures_working_file_changes_instead_of_hardcoding_zero(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    real_record_event = core.record_event
+
+    def mutating_record_event(report, base_dir=None, event="scan"):
+        (repo / "unexpected.txt").write_text("changed\n", encoding="utf-8")
+        return real_record_event(report, base_dir=base_dir, event=event)
+
+    monkeypatch.setattr(core, "record_event", mutating_record_event)
+
+    result = scan_projects([str(repo)], base_dir=str(tmp_path / "state"))
+
+    assert result["summary"]["working_files_changed"] == 1
+    assert result["summary"]["working_files_changed_paths"] == [str(repo / "unexpected.txt")]
+
+
+def test_scan_detects_content_change_when_porcelain_status_is_unchanged(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    tracked = repo / "README.md"
+    tracked.write_text("dirty before\n", encoding="utf-8")
+    real_record_event = core.record_event
+
+    def mutating_record_event(report, base_dir=None, event="scan"):
+        tracked.write_text("dirty after\n", encoding="utf-8")
+        return real_record_event(report, base_dir=base_dir, event=event)
+
+    monkeypatch.setattr(core, "record_event", mutating_record_event)
+
+    result = scan_projects([str(repo)], base_dir=str(tmp_path / "state"))
+
+    assert result["summary"]["working_files_changed"] == 1
+    assert result["summary"]["working_files_changed_paths"] == [str(tracked)]
+
+
+def test_relative_xdg_state_home_is_ignored(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    monkeypatch.setattr(core.sys, "platform", "linux")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_STATE_HOME", ".state")
+
+    assert core._event_path(None) == home / ".local" / "state" / "version-drift" / "events.jsonl"
 
 
 def test_inspect_classifies_synced_repository(tmp_path):
@@ -257,9 +323,24 @@ def test_sync_projects_applies_only_clean_fast_forwards(tmp_path):
     result = sync_projects([str(tmp_path)], base_dir=str(tmp_path / "state"), apply=True, fetch=True)
 
     assert result["summary"]["applied"] == 1
+    assert result["summary"]["working_files_changed"] == 2
     assert (safe / "remote.txt").exists()
     assert (safe / "second.txt").exists()
     assert (dirty / "notes.txt").read_text(encoding="utf-8") == "keep\n"
+
+
+def test_cli_single_repo_sync_apply_reports_changed_files(tmp_path, capsys):
+    seed, _, clone = _remote_clone(tmp_path)
+    _commit(seed, "remote.txt", "remote\n", "remote")
+    _git(seed, "push")
+
+    rc = main(["--base-dir", str(tmp_path / "state"), "sync", str(clone), "--apply", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["summary"]["applied"] == 1
+    assert payload["summary"]["working_files_changed"] == 1
+    assert payload["summary"]["working_files_changed_paths"] == [str(clone / "remote.txt")]
 
 
 def test_sync_project_aborts_if_state_changes_before_apply(monkeypatch, tmp_path):
@@ -321,3 +402,28 @@ def test_cli_inspect_json_preserves_blocked_exit_code(tmp_path, capsys):
     out = capsys.readouterr().out
     assert '"schema": "version-drift/1"' in out
     assert '"state": "protected"' in out
+
+
+def test_cli_version_comes_from_installed_package_metadata(monkeypatch, capsys):
+    monkeypatch.setattr("version_drift.cli.metadata.version", lambda name: "9.8.7")
+
+    try:
+        main(["--version"])
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    assert capsys.readouterr().out.strip() == "version-drift 9.8.7"
+
+
+def test_cli_version_falls_back_to_source_version_without_distribution_metadata(monkeypatch, capsys):
+    def missing(name):
+        raise metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr("version_drift.cli.metadata.version", missing)
+
+    try:
+        main(["--version"])
+    except SystemExit as exc:
+        assert exc.code == 0
+
+    assert capsys.readouterr().out.strip() == "version-drift 0.2.1"

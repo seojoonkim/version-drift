@@ -30,13 +30,7 @@ The example above illustrates the output format. It is not an adoption claim or 
 
 ## Install
 
-Until the first PyPI release is live, install the versioned GitHub Release wheel:
-
-```bash
-pipx install https://github.com/seojoonkim/version-drift/releases/download/v0.2.0/version_drift-0.2.0-py3-none-any.whl
-```
-
-After PyPI publication, the canonical commands will be:
+Install from PyPI:
 
 ```bash
 uv tool install version-drift
@@ -128,10 +122,13 @@ Repositories with local work or ambiguous history remain untouched.
 Every scan and sync decision is appended to:
 
 ```text
-.version-drift/events.jsonl
+macOS: ~/Library/Application Support/VersionDrift/events.jsonl
+Linux: ${XDG_STATE_HOME:-~/.local/state}/version-drift/events.jsonl
 ```
 
-The current schema is `version-drift/1`. Choose another state root with `--base-dir` or `VERSION_DRIFT_DIR`.
+The state file defaults outside your Git repositories, so recording a checkup does not dirty the repository where you invoked VersionDrift. The current schema is `version-drift/1`. Choose another state root with `--base-dir` or `VERSION_DRIFT_DIR`; explicit state roots retain the legacy `.version-drift/events.jsonl` suffix for compatibility.
+
+`Working files changed` is measured from repository HEAD and worktree snapshots taken before and after the command. A read-only scan should report `0`; an applied fast-forward reports the files changed by the accepted upstream commits.
 
 VersionDrift sends no telemetry and never uploads repository paths, remotes, or results.
 

@@ -2,6 +2,15 @@
 
 All notable changes to VersionDrift are documented here.
 
+## [0.2.1] - 2026-08-21
+
+### Fixed
+
+- Store default decision events in the platform user-state directory instead of the current working directory, preventing VersionDrift from dirtying the repository that launched it.
+- Measure and report working-file changes from before/after Git snapshots instead of hardcoding zero.
+- Read the CLI version from installed package metadata.
+- Replace pre-publication installation instructions with canonical PyPI commands.
+
 ## [0.2.0] - 2026-08-21
 
 ### Added

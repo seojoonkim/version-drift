@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -207,8 +208,87 @@ def inspect_project(path: str, fetch: bool = False) -> Dict[str, Any]:
 
 
 def _event_path(base_dir: Optional[str]) -> Path:
-    root = Path(base_dir).expanduser() if base_dir else Path(os.environ.get("VERSION_DRIFT_DIR", Path.cwd()))
-    return root / _EVENT_STORE
+    if base_dir:
+        return Path(base_dir).expanduser() / _EVENT_STORE
+    configured = os.environ.get("VERSION_DRIFT_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser() / _EVENT_STORE
+    if sys.platform == "darwin":
+        state_dir = Path.home() / "Library" / "Application Support" / "VersionDrift"
+    else:
+        configured_state = Path(os.environ.get("XDG_STATE_HOME", "")).expanduser()
+        state_root = configured_state if configured_state.is_absolute() else Path.home() / ".local" / "state"
+        state_dir = state_root / "version-drift"
+    return state_dir / "events.jsonl"
+
+
+def _working_content_snapshot(path: Path) -> Tuple[str, List[str], bool]:
+    diff = _run_git(path, ["diff", "--binary", "HEAD", "--"])
+    tracked_names = _run_git(path, ["diff", "--name-only", "HEAD", "--"])
+    untracked_names = _run_git(path, ["ls-files", "--others", "--exclude-standard"])
+    if not diff.ok or not tracked_names.ok or not untracked_names.ok:
+        return "", [], False
+    names = sorted(set(tracked_names.stdout.splitlines()) | set(untracked_names.stdout.splitlines()))
+    digest = hashlib.sha256(diff.stdout.encode("utf-8", errors="surrogateescape"))
+    for name in untracked_names.stdout.splitlines():
+        digest.update(name.encode("utf-8", errors="surrogateescape"))
+        try:
+            digest.update((path / name).read_bytes())
+        except OSError:
+            return "", names, False
+    return digest.hexdigest(), names, True
+
+
+def _repository_snapshots(paths: Iterable[Path]) -> Dict[str, Dict[str, Any]]:
+    snapshots: Dict[str, Dict[str, Any]] = {}
+    for raw_path in paths:
+        path = Path(raw_path).resolve()
+        head = _run_git(path, ["rev-parse", "HEAD"])
+        status = _run_git(path, ["status", "--porcelain=v1", "-uall"])
+        content_fingerprint, content_paths, content_ok = _working_content_snapshot(path)
+        snapshots[str(path)] = {
+            "head": head.stdout if head.ok else "",
+            "status": status.stdout.splitlines() if status.ok and status.stdout else [],
+            "content_fingerprint": content_fingerprint,
+            "content_paths": content_paths,
+            "valid": head.ok and status.ok and content_ok,
+        }
+    return snapshots
+
+
+def _changed_working_paths(
+    before: Dict[str, Dict[str, Any]], after: Dict[str, Dict[str, Any]]
+) -> List[str]:
+    changed: set[str] = set()
+    for repo_path, prior in before.items():
+        current = after.get(repo_path)
+        if not current or not prior.get("valid") or not current.get("valid"):
+            continue
+        repo = Path(repo_path)
+        prior_status = set(prior.get("status", []))
+        current_status = set(current.get("status", []))
+        for line in prior_status.symmetric_difference(current_status):
+            if len(line) >= 4:
+                changed.add(str((repo / line[3:]).resolve()))
+        if prior.get("content_fingerprint") != current.get("content_fingerprint"):
+            content_paths = set(prior.get("content_paths", [])) | set(current.get("content_paths", []))
+            changed.update(str((repo / name).resolve()) for name in content_paths)
+        old_head = str(prior.get("head", ""))
+        new_head = str(current.get("head", ""))
+        if old_head and new_head and old_head != new_head:
+            diff = _run_git(repo, ["diff", "--name-only", old_head, new_head])
+            if diff.ok:
+                changed.update(str((repo / name).resolve()) for name in diff.stdout.splitlines() if name)
+    return sorted(changed)
+
+
+def _attach_change_measurement(
+    result: Dict[str, Any], before: Dict[str, Dict[str, Any]], after: Dict[str, Dict[str, Any]]
+) -> Dict[str, Any]:
+    changed = _changed_working_paths(before, after)
+    result["summary"]["working_files_changed"] = len(changed)
+    result["summary"]["working_files_changed_paths"] = changed
+    return result
 
 
 def record_event(report: Dict[str, Any], base_dir: Optional[str] = None, event: str = "scan") -> Dict[str, Any]:
@@ -237,10 +317,13 @@ def summarize(reports: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def scan_projects(roots: Iterable[str], base_dir: Optional[str] = None, fetch: bool = False, max_depth: int = 5) -> Dict[str, Any]:
-    reports = [inspect_project(str(path), fetch=fetch) for path in discover_projects(roots, max_depth=max_depth)]
+    projects = discover_projects(roots, max_depth=max_depth)
+    before = _repository_snapshots(projects)
+    reports = [inspect_project(str(path), fetch=fetch) for path in projects]
     for report in reports:
         record_event(report, base_dir=base_dir, event="scan")
-    return {"summary": summarize(reports), "projects": reports}
+    result = {"summary": summarize(reports), "projects": reports}
+    return _attach_change_measurement(result, before, _repository_snapshots(projects))
 
 
 def _same_apply_snapshot(before: Dict[str, Any], current: Dict[str, Any]) -> bool:
@@ -286,9 +369,11 @@ def sync_project(path: str, base_dir: Optional[str] = None, apply: bool = False,
 
 def sync_projects(roots: Iterable[str], base_dir: Optional[str] = None, apply: bool = False, fetch: bool = True, max_depth: int = 5) -> Dict[str, Any]:
     """Preview or apply safe fast-forwards across repositories under roots."""
+    projects = discover_projects(roots, max_depth=max_depth)
+    before_snapshots = _repository_snapshots(projects)
     results = [
         sync_project(str(repo), base_dir=base_dir, apply=apply, fetch=fetch)
-        for repo in discover_projects(roots, max_depth=max_depth)
+        for repo in projects
     ]
     summary = {
         "total": len(results),
@@ -299,7 +384,8 @@ def sync_projects(roots: Iterable[str], base_dir: Optional[str] = None, apply: b
         "failed": sum(item.get("reason") in {"fast_forward_failed", "state_changed_before_apply"} for item in results),
         "working_files_changed": 0,
     }
-    return {"summary": summary, "projects": results}
+    result = {"summary": summary, "projects": results}
+    return _attach_change_measurement(result, before_snapshots, _repository_snapshots(projects))
 
 
 __all__ = [

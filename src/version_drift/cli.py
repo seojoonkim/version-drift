@@ -4,10 +4,19 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from importlib import metadata
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-from .core import default_roots, inspect_project, record_event, scan_projects, sync_project, sync_projects
+from . import __version__
+from .core import default_roots, inspect_project, record_event, scan_projects, sync_projects
+
+
+def _package_version() -> str:
+    try:
+        return metadata.version("version-drift")
+    except metadata.PackageNotFoundError:
+        return __version__
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -16,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Find out-of-sync Git repositories without touching local work",
     )
     parser.add_argument("--base-dir", default="", help="Directory for .version-drift/events.jsonl")
-    parser.add_argument("--version", action="version", version="%(prog)s 0.2.0")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {_package_version()}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", help="Run a read-only Git checkup under bounded roots")
@@ -83,7 +92,7 @@ def _print_scan(result: dict[str, Any], roots: Sequence[str]) -> None:
         for report in protected[:10]:
             reason = ", ".join(report.get("reasons") or [report.get("state", "unknown")])
             print(f"  {_display_path(report['path'], roots):<32} {reason}")
-    print("\nWorking files changed: 0")
+    print(f"\nWorking files changed: {summary['working_files_changed']}")
     print("Remote data: refreshed now" if any(report.get("remote_data") == "fetched_now" for report in result["projects"]) else "Remote data: local tracking refs")
 
 
@@ -95,7 +104,7 @@ def _print_sync(result: dict[str, Any], apply: bool) -> None:
         print(f"{summary['safe']} repositories can be fast-forwarded.")
         print(f"{summary['protected']} are protected because they contain local work or ambiguous history.")
         print("Nothing was changed. Add --apply to update the safe repositories.")
-    print("Working files changed: 0")
+    print(f"Working files changed: {summary['working_files_changed']}")
 
 
 def _resolved_scan_roots(args: argparse.Namespace) -> list[str]:
@@ -122,9 +131,13 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     paths = args.paths
     if len(paths) == 1 and (Path(paths[0]).expanduser() / ".git").exists():
-        result = sync_project(paths[0], base_dir=base_dir, apply=args.apply, fetch=not args.no_fetch)
-        print(json.dumps(result, ensure_ascii=False, sort_keys=True) if args.json else result)
-        return 0 if result.get("applied") or (not args.apply and not result.get("blocked")) else 1
+        result = sync_projects(paths, base_dir=base_dir, apply=args.apply, fetch=not args.no_fetch, max_depth=0)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        else:
+            _print_sync(result, args.apply)
+        item = result["projects"][0]
+        return 0 if item.get("applied") or (not args.apply and not item.get("blocked")) else 1
     result = sync_projects(paths, base_dir=base_dir, apply=args.apply, fetch=not args.no_fetch, max_depth=args.max_depth)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
