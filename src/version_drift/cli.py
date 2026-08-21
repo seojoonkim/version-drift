@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import sys
 from importlib import metadata
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from . import __version__
-from .core import default_roots, inspect_project, record_event, scan_projects, sync_projects
+from .config import config_path, resolve_roots, write_config
+from .core import inspect_project, record_event, scan_projects, sync_projects
+from .inbox import build_inbox
 
 
 def _package_version() -> str:
@@ -35,6 +37,16 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--fetch", action="store_true", help="Refresh remote-tracking refs before comparison")
     scan.add_argument("--json", action="store_true")
     scan.add_argument("--check", action="store_true", help="Exit 1 when drift is found")
+
+    init = sub.add_parser("init", help="Save default roots without scanning repositories")
+    init.add_argument("roots", nargs="*", help="Existing directory roots; defaults to cwd")
+    init.add_argument("--json", action="store_true")
+
+    inbox = sub.add_parser("inbox", help="Show repository changes since the previous inbox check")
+    inbox.add_argument("roots", nargs="*", help="Optional roots; defaults to saved configuration")
+    inbox.add_argument("--max-depth", type=int, default=5)
+    inbox.add_argument("--fetch", action="store_true")
+    inbox.add_argument("--json", action="store_true")
 
     inspect = sub.add_parser("inspect", help="Inspect one Git repository")
     inspect.add_argument("path")
@@ -109,20 +121,62 @@ def _print_sync(result: dict[str, Any], apply: bool) -> None:
 
 def _resolved_scan_roots(args: argparse.Namespace) -> list[str]:
     roots = [*(args.roots or []), *(args.root or [])]
-    return roots or default_roots() or [os.getcwd()]
+    return resolve_roots(roots)
+
+
+def _print_inbox(result: dict[str, Any]) -> None:
+    counts = result["counts"]
+    total = sum(counts.values())
+    print(f"VersionDrift inbox: {total} change{'s' if total != 1 else ''}")
+    labels = (("New", "new"), ("Changed", "changed"), ("Resolved", "resolved"))
+    for label, key in labels:
+        if not result[key]:
+            continue
+        print(f"\n{label}")
+        for item in result[key]:
+            record = item.get("current") or item.get("previous") or {}
+            print(f"  {item['repo']}  {record.get('state', 'unknown')}")
+    if not total:
+        print("No repository state changes since the previous checkup.")
+    print(f"Working files changed: {result['scan_summary']['working_files_changed']}")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     base_dir = args.base_dir or None
+    if args.command == "init":
+        try:
+            roots = write_config(args.roots)
+        except (OSError, ValueError) as exc:
+            print(f"version-drift init: {exc}", file=sys.stderr)
+            return 2
+        result = {"schema": "version-drift/config/1", "path": str(config_path()), "roots": roots}
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True) if args.json else f"Saved {len(roots)} root(s) to {config_path()}")
+        return 0
     if args.command == "scan":
-        roots = _resolved_scan_roots(args)
+        try:
+            roots = _resolved_scan_roots(args)
+        except ValueError as exc:
+            print(f"version-drift scan: {exc}", file=sys.stderr)
+            return 2
         result = scan_projects(roots, base_dir=base_dir, fetch=args.fetch, max_depth=args.max_depth)
         if args.json:
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         else:
             _print_scan(result, roots)
         return 1 if args.check and not result["summary"]["ok"] else 0
+    if args.command == "inbox":
+        try:
+            roots = resolve_roots(args.roots)
+            result = build_inbox(roots, base_dir=base_dir, fetch=args.fetch, max_depth=args.max_depth)
+        except (OSError, ValueError) as exc:
+            print(f"version-drift inbox: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        else:
+            _print_inbox(result)
+        return 0
     if args.command == "inspect":
         report = inspect_project(args.path, fetch=args.fetch)
         record_event(report, base_dir=base_dir, event="inspect")
