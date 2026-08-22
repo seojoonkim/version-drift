@@ -37,6 +37,10 @@ _UTC_TIMESTAMP = re.compile(
 )
 
 
+def _store_opened(directory_fd: int) -> None:
+    """Test hook called after the store directory has been securely opened."""
+
+
 def _fail(message: str) -> ValueError:
     return ValueError("invalid integration intent: " + message)
 
@@ -180,9 +184,94 @@ class IntegrationIntentStore:
             raise ValueError(f"integration intent store is not a directory: {self.directory}")
         return True
 
+    def _open_directory(self) -> int:
+        if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+            raise RuntimeError("secure integration intent store access is unavailable")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        return os.open(str(self.directory), flags)
+
+    @staticmethod
+    def _open_entry(directory_fd: int, name: str) -> int:
+        if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
+            raise RuntimeError("secure integration intent entry access is unavailable")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        entry_fd = os.open(name, flags, dir_fd=directory_fd)
+        if not stat.S_ISREG(os.fstat(entry_fd).st_mode):
+            os.close(entry_fd)
+            raise ValueError(f"integration intent entry is not a regular file: {name}")
+        return entry_fd
+
+    def _load_from_directory(self, directory_fd: int, intent_id: str) -> IntegrationIntent:
+        name = _intent_id(intent_id) + ".json"
+        try:
+            entry_fd = self._open_entry(directory_fd, name)
+            with os.fdopen(entry_fd, "r", encoding="utf-8") as source:
+                payload = json.load(source, object_pairs_hook=_unique_object)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            if isinstance(exc, FileNotFoundError):
+                raise
+            raise _fail(f"cannot load {intent_id}: {exc}") from exc
+        intent = IntegrationIntent.from_dict(payload)
+        if intent.intent_id != intent_id:
+            raise _fail("filename does not match envelope intent_id")
+        return intent
+
+    def _create_posix(self, validated: IntegrationIntent) -> Path:
+        if not self._validate_directory():
+            self.directory.mkdir(parents=True)
+            self._validate_directory()
+        destination = self._path(validated.intent_id)
+        directory_fd = self._open_directory()
+        try:
+            _store_opened(directory_fd)
+            if os.open not in os.supports_dir_fd or os.unlink not in os.supports_dir_fd:
+                raise RuntimeError("descriptor-relative intent creation is unavailable")
+            if os.link not in os.supports_dir_fd:
+                raise RuntimeError("atomic immutable intent publication is unavailable")
+            temporary_name = f".{validated.intent_id}.{secrets.token_hex(8)}.tmp"
+            destination_name = validated.intent_id + ".json"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            temporary_fd = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+            try:
+                try:
+                    data = (
+                        json.dumps(
+                            validated.to_dict(), ensure_ascii=False, indent=2, sort_keys=True
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                    view = memoryview(data)
+                    while view:
+                        written = os.write(temporary_fd, view)
+                        if written == 0:
+                            raise OSError("short write while storing integration intent")
+                        view = view[written:]
+                    os.fsync(temporary_fd)
+                finally:
+                    os.close(temporary_fd)
+                os.link(
+                    temporary_name,
+                    destination_name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                os.fsync(directory_fd)
+            finally:
+                try:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(directory_fd)
+        return destination
+
     def create(self, intent: IntegrationIntent) -> Path:
         # Re-parse so only a fully validated envelope reaches storage.
         validated = IntegrationIntent.from_dict(intent.to_dict())
+        if os.name == "posix":
+            return self._create_posix(validated)
         if not self._validate_directory():
             self.directory.mkdir(parents=True)
             self._validate_directory()
@@ -193,7 +282,6 @@ class IntegrationIntentStore:
         text = json.dumps(validated.to_dict(), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         try:
             atomic_write_text(temporary, text)
-            # A hard link publishes atomically and fails if the immutable ID exists.
             os.link(temporary, destination)
         finally:
             try:
@@ -203,6 +291,15 @@ class IntegrationIntentStore:
         return destination
 
     def load(self, intent_id: str) -> IntegrationIntent:
+        _intent_id(intent_id)
+        if os.name == "posix":
+            self._validate_directory()
+            directory_fd = self._open_directory()
+            try:
+                _store_opened(directory_fd)
+                return self._load_from_directory(directory_fd, intent_id)
+            finally:
+                os.close(directory_fd)
         path = self._path(intent_id)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
@@ -218,6 +315,16 @@ class IntegrationIntentStore:
     def list(self) -> List[IntegrationIntent]:
         if not self._validate_directory():
             return []
+        if os.name == "posix":
+            if os.listdir not in os.supports_fd:
+                raise RuntimeError("descriptor-relative intent listing is unavailable")
+            directory_fd = self._open_directory()
+            try:
+                _store_opened(directory_fd)
+                names = sorted(name for name in os.listdir(directory_fd) if name.endswith(".json"))
+                return [self._load_from_directory(directory_fd, name[:-5]) for name in names]
+            finally:
+                os.close(directory_fd)
         paths = sorted(
             (path for path in self.directory.iterdir() if path.suffix == ".json"),
             key=lambda item: item.name,

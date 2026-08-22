@@ -1,4 +1,5 @@
 import json
+import os
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
@@ -240,22 +241,67 @@ def test_default_store_obeys_version_drift_state_environment(monkeypatch, tmp_pa
     assert store.directory == tmp_path / "state" / ".version-drift" / "integration-intents"
 
 
-def test_create_uses_atomic_write_helper(monkeypatch, tmp_path):
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative race regression is POSIX-only")
+def test_create_stays_anchored_when_store_is_replaced_after_open(monkeypatch, tmp_path):
     import version_drift.integrate.intent as module
 
-    calls = []
-    real = module.atomic_write_text
+    store = IntegrationIntentStore(base_dir=tmp_path / "state")
+    store.directory.mkdir(parents=True)
+    original = tmp_path / "opened-store"
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
 
-    def recording_write(path, text):
-        calls.append(path)
-        real(path, text)
+    def replace_store(_directory_fd):
+        store.directory.rename(original)
+        store.directory.symlink_to(attacker, target_is_directory=True)
 
-    monkeypatch.setattr(module, "atomic_write_text", recording_write)
-    store = IntegrationIntentStore(base_dir=tmp_path)
+    monkeypatch.setattr(module, "_store_opened", replace_store)
+    result = store.create(intent())
 
+    assert result == store.directory / "intent-001.json"
+    assert list(attacker.iterdir()) == []
+    assert json.loads((original / "intent-001.json").read_text(encoding="utf-8")) == intent().to_dict()
+    assert not list(original.glob(".*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative race regression is POSIX-only")
+@pytest.mark.parametrize("operation", ["list", "load"])
+def test_reads_stay_anchored_when_store_is_replaced_after_open(
+    monkeypatch, tmp_path, operation
+):
+    import version_drift.integrate.intent as module
+
+    store = IntegrationIntentStore(base_dir=tmp_path / "state")
     store.create(intent())
+    original = tmp_path / "opened-store"
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    external = intent(summary="attacker-controlled")
+    (attacker / "intent-001.json").write_text(
+        json.dumps(external.to_dict()), encoding="utf-8"
+    )
 
-    assert len(calls) == 1
-    assert calls[0].parent == store.directory
-    assert calls[0].name.startswith(".intent-001.")
-    assert calls[0].suffix == ".tmp"
+    def replace_store(_directory_fd):
+        store.directory.rename(original)
+        store.directory.symlink_to(attacker, target_is_directory=True)
+
+    monkeypatch.setattr(module, "_store_opened", replace_store)
+    result = store.list() if operation == "list" else [store.load("intent-001")]
+
+    assert result == [intent()]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlink regression is POSIX-only")
+@pytest.mark.parametrize("operation", ["list", "load"])
+def test_reads_reject_symlinked_json_entry(operation, tmp_path):
+    store = IntegrationIntentStore(base_dir=tmp_path / "state")
+    store.directory.mkdir(parents=True)
+    external = tmp_path / "external.json"
+    external.write_text(json.dumps(intent().to_dict()), encoding="utf-8")
+    (store.directory / "intent-001.json").symlink_to(external)
+
+    with pytest.raises(ValueError, match="regular file|symlink|cannot load"):
+        if operation == "list":
+            store.list()
+        else:
+            store.load("intent-001")
