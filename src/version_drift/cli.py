@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
+import subprocess
 import sys
+from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -22,6 +26,15 @@ from .core import (
 from .doctor import run_doctor
 from .explain import explain_reports
 from .inbox import build_inbox
+from .integrate import (
+    INTENT_SCHEMA,
+    BoardStatus,
+    IntegrationBoard,
+    IntegrationIntent,
+    IntegrationIntentStore,
+)
+
+_FULL_OID = re.compile(r"[0-9a-f]{40}\Z")
 
 
 def _package_version() -> str:
@@ -88,6 +101,38 @@ def build_parser() -> argparse.ArgumentParser:
     sync.set_defaults(fetch=True)
     sync.add_argument("--max-depth", type=int, default=5)
     sync.add_argument("--json", action="store_true")
+
+    integrate = sub.add_parser(
+        "integrate",
+        help="Coordinate and observe agent integration intents (does not merge)",
+        description=("Local coordination and observation for agent integration intents. "
+                     "This does not merge branches or change Git state."),
+    )
+    integrate_sub = integrate.add_subparsers(dest="integrate_command", required=True)
+    intent = integrate_sub.add_parser("intent", help="Create or list immutable intents")
+    intent_sub = intent.add_subparsers(dest="intent_command", required=True)
+    add = intent_sub.add_parser(
+        "add", help="Pin refs and write one immutable VersionDrift intent (no Git changes)")
+    add.add_argument("repository", help="Local Git repository")
+    add.add_argument("--repository-id", required=True, help="Stable identity shared by board commands")
+    add.add_argument("--intent-id", required=True)
+    add.add_argument("--agent-id", required=True)
+    add.add_argument("--source", required=True, dest="source_ref", help="Local source commit-ish")
+    add.add_argument("--target", required=True, dest="target_ref", help="Local target commit-ish")
+    add.add_argument("--summary", required=True)
+    add.add_argument("--depends-on", action="append", default=[], dest="dependencies")
+    add.add_argument("--json", action="store_true")
+    list_intents = intent_sub.add_parser(
+        "list", help="Read immutable intents; does not change Git or VersionDrift state")
+    list_intents.add_argument("repository", help="Local Git repository")
+    list_intents.add_argument("--repository-id", required=True)
+    list_intents.add_argument("--json", action="store_true")
+    board = integrate_sub.add_parser(
+        "board", help="Observe pinned intents; does not merge or change Git state")
+    board.add_argument("repository", help="Local Git repository")
+    board.add_argument("--repository-id", required=True)
+    board.add_argument("--target", required=True, dest="target_ref", help="Local target commit-ish")
+    board.add_argument("--json", action="store_true")
     return parser
 
 
@@ -221,9 +266,126 @@ def _print_doctor(result: dict[str, Any]) -> None:
     print("Nothing was changed.")
 
 
+def _git_read(repository: str, *arguments: str) -> str:
+    env = os.environ.copy()
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    try:
+        completed = subprocess.run(
+            ["git", *arguments], cwd=repository, env=env, check=False, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise ValueError(f"cannot inspect repository: {exc}") from exc
+    output = completed.stdout.strip()
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or "Git inspection failed"
+        raise ValueError(detail)
+    return output
+
+
+def _repository_path(repository: str) -> Path:
+    selected = Path(repository).expanduser().resolve()
+    if not selected.is_dir():
+        raise ValueError(f"repository does not exist: {selected}")
+    top = _git_read(str(selected), "rev-parse", "--show-toplevel")
+    path = Path(top).resolve()
+    if not path.is_dir():
+        raise ValueError("Git returned an invalid repository path")
+    return path
+
+
+def _resolve_commit(repository: Path, ref: str, label: str) -> str:
+    try:
+        oid = _git_read(str(repository), "rev-parse", "--verify", "--end-of-options", ref + "^{commit}")
+    except ValueError as exc:
+        raise ValueError(f"cannot resolve {label} ref {ref!r} locally") from exc
+    if _FULL_OID.fullmatch(oid) is None:
+        raise ValueError(f"cannot resolve {label} ref {ref!r} to a full commit OID")
+    return oid
+
+
+def _print_intents(intents: Sequence[IntegrationIntent]) -> None:
+    print(f"Integration intents: {len(intents)}")
+    for intent in intents:
+        dependencies = ",".join(intent.dependency_intent_ids) or "none"
+        print(f"  {intent.intent_id}  {intent.source_ref} -> {intent.target_ref}  dependencies={dependencies}")
+    print("Nothing in Git was changed.")
+
+
+def _print_board(result: dict[str, Any]) -> None:
+    reason = f" ({result['reason']})" if result["reason"] else ""
+    print(f"Integration board: {result['status']}{reason}")
+    for position, item in enumerate(result["items"], 1):
+        item_reason = f" ({item['reason']})" if item["reason"] else ""
+        print(f"  {position}. {item['intent_id']}: {item['status']}{item_reason}")
+    print("Nothing in Git was changed.")
+
+
+def _run_integrate(args: argparse.Namespace, base_dir: Optional[str]) -> int:
+    store = IntegrationIntentStore(Path(base_dir) if base_dir else None)
+    try:
+        repository = _repository_path(args.repository)
+        if args.integrate_command == "intent" and args.intent_command == "add":
+            source_oid = _resolve_commit(repository, args.source_ref, "source")
+            target_oid = _resolve_commit(repository, args.target_ref, "target")
+            created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            intent = IntegrationIntent(
+                schema=INTENT_SCHEMA, intent_id=args.intent_id, agent_id=args.agent_id,
+                repository_path=str(repository), repository_id=args.repository_id,
+                source_ref=args.source_ref, target_ref=args.target_ref,
+                base_oid=target_oid, source_oid=source_oid, target_oid=target_oid,
+                summary=args.summary, dependency_intent_ids=tuple(args.dependencies),
+                created_at=created_at,
+            )
+            store.create(intent)
+            if args.json:
+                print(json.dumps(intent.to_dict(), ensure_ascii=False, sort_keys=True))
+            else:
+                print(f"Created immutable integration intent {intent.intent_id}.")
+                print("Only VersionDrift local state was written; Git was not changed.")
+            return 0
+        if args.integrate_command == "intent":
+            try:
+                values = store.list()
+            except (OSError, UnicodeError, ValueError, TypeError) as exc:
+                print(f"version-drift integrate intent list: malformed or unreadable store: {exc}",
+                      file=sys.stderr)
+                return 3
+            intents = [
+                value for value in values
+                if value.repository_path == str(repository) and value.repository_id == args.repository_id
+            ]
+            if args.json:
+                print(json.dumps([value.to_dict() for value in intents], ensure_ascii=False, sort_keys=True))
+            else:
+                _print_intents(intents)
+            return 0
+
+        _resolve_commit(repository, args.target_ref, "target")
+        result = IntegrationBoard(repository, args.repository_id, args.target_ref).inspect_store(store)
+        payload = result.to_dict()
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            _print_board(payload)
+        if result.status is BoardStatus.READY:
+            return 0
+        if result.status in {BoardStatus.BLOCKED, BoardStatus.STALE}:
+            return 1
+        return 3
+    except FileExistsError:
+        print(f"version-drift integrate: intent {args.intent_id!r} already exists", file=sys.stderr)
+        return 1
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        print(f"version-drift integrate: {exc}", file=sys.stderr)
+        return 2
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     base_dir = args.base_dir or None
+    if args.command == "integrate":
+        return _run_integrate(args, base_dir)
     if hasattr(args, "max_depth") and args.max_depth < 0:
         print(f"version-drift {args.command}: max depth must be non-negative", file=sys.stderr)
         return 2

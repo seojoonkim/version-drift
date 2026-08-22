@@ -130,6 +130,34 @@ All commands support the global `--base-dir DIR`; machine-readable commands offe
 
 `scan`, `inbox`, `explain`, and `sync` also accept `--max-depth N` where applicable; the default discovery depth is 5.
 
+## Agent integration board (shipped MVP)
+
+The integration board is a local coordination and observation surface for agents. Give every repository a stable, explicit `--repository-id`; use the same value for add, list, and board. No network access or fetch is required.
+
+```bash
+# Record an immutable request, pinning both refs to their current full commit OIDs.
+version-drift integrate intent add ~/code/project \
+  --repository-id project-1 --intent-id api-change --agent-id agent-api \
+  --source refs/heads/agent/api --target refs/heads/main \
+  --summary "Add the API endpoint"
+
+# A dependent request; --depends-on is repeatable.
+version-drift integrate intent add ~/code/project \
+  --repository-id project-1 --intent-id ui-change --agent-id agent-ui \
+  --source refs/heads/agent/ui --target refs/heads/main \
+  --summary "Use the endpoint" --depends-on api-change
+
+version-drift integrate intent list ~/code/project --repository-id project-1
+version-drift integrate board ~/code/project \
+  --repository-id project-1 --target refs/heads/main --json
+```
+
+`intent add` resolves source and target locally and writes only VersionDrift's external local intent state; an existing intent ID is never overwritten. `intent list` and `board` are strictly read-only: no branches are merged, no conflicts are resolved, and no Git refs, worktrees, or indexes are changed. The board reports a deterministic dependency order and stable reason codes. A ref moving away from its pinned OID makes an intent `STALE`; an unobservable ref or malformed store is `UNKNOWN`, and **UNKNOWN = BLOCKED** for policy purposes.
+
+Board exit codes are exact: `0` for `READY`, `1` for `BLOCKED` or `STALE`, `2` for CLI/repository/ref validation errors, and `3` for `UNKNOWN` (including malformed state). Intent/list operational failures follow the general exit-code contract below.
+
+This shipped MVP does **not** perform merge-tree analysis, propose or apply integrations, resolve conflicts, acquire leases, create sandboxes/worktrees, or invoke an LLM. Those are future ideas, not current capabilities.
+
 ---
 
 ## Machine-readable contract
@@ -144,7 +172,7 @@ The VersionDrift 1.x safety/report core freezes these schema identifiers and est
 - plan envelope: `version-drift/plan/1`
 - doctor envelope: `version-drift/doctor/1`
 
-Other command contracts are `version-drift/config/1`, `version-drift/inbox/1`, `version-drift/explain/1`, and `version-drift/history/1`.
+Other command contracts are `version-drift/config/1`, `version-drift/inbox/1`, `version-drift/explain/1`, `version-drift/history/1`, `version-drift/integration-intent/1`, and `version-drift/integration-board/1`.
 
 Legacy report fields are retained. Additive, orthogonal fields and new fail-closed reason/event values may appear in 1.x; consumers must ignore unknown fields and tolerate values that follow existing safety semantics. Fields are not removed, moved, renamed without retaining the legacy field, or given incompatible meaning during 1.x. Semantic breaks—including weaker apply checks—require a new major version and migration guidance. See the exact [VersionDrift 1.x compatibility contract](COMPATIBILITY.md).
 
