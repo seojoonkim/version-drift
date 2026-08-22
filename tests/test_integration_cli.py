@@ -163,6 +163,43 @@ def test_list_human_and_json_are_deterministic_and_malformed_store_fails_closed(
     assert path.read_bytes() == before
 
 
+@pytest.mark.parametrize("kind", ["file", "directory-symlink", "dangling-symlink"])
+def test_list_and_board_fail_closed_for_invalid_store_paths(kind, repo, tmp_path, capsys):
+    state = tmp_path / "state"
+    store_path = state / ".version-drift" / "integration-intents"
+    store_path.parent.mkdir(parents=True)
+    if kind == "file":
+        store_path.write_text("not a directory", encoding="utf-8")
+    else:
+        target = tmp_path / "intent-target"
+        if kind == "directory-symlink":
+            target.mkdir()
+        try:
+            store_path.symlink_to(target, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+
+    list_command = [
+        "integrate", "intent", "list", str(repo),
+        "--repository-id", "local-repo-1", "--json",
+    ]
+    code, output, error = invoke(capsys, state, *list_command)
+    assert code == 3
+    assert output == ""
+    assert "malformed or unreadable store" in error
+
+    board_command = [
+        "integrate", "board", str(repo), "--repository-id", "local-repo-1",
+        "--target", "HEAD", "--json",
+    ]
+    code, output, error = invoke(capsys, state, *board_command)
+    assert code == 3
+    assert error == ""
+    payload = json.loads(output)
+    assert payload["status"] == "UNKNOWN"
+    assert payload["reason"] == "MALFORMED_INTENT_STORE"
+
+
 def test_board_ready_human_json_order_and_exit_codes(repo, tmp_path, capsys):
     state = tmp_path / "state"
     assert invoke(capsys, state, *add_args(repo, "z"))[0] == 0

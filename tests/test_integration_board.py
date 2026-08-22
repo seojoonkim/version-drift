@@ -302,6 +302,18 @@ def test_store_loading_and_malformed_persisted_intent_fail_closed(repo, tmp_path
     assert result.reason is ReasonCode.MALFORMED_INTENT_STORE
 
 
+def test_invalid_store_path_makes_board_unknown(repo, tmp_path):
+    store = IntegrationIntentStore(base_dir=tmp_path / "state")
+    store.directory.parent.mkdir(parents=True)
+    store.directory.write_text("not a directory", encoding="utf-8")
+
+    result = board(repo).inspect_store(store)
+
+    assert result.status is BoardStatus.UNKNOWN
+    assert result.items == ()
+    assert result.reason is ReasonCode.MALFORMED_INTENT_STORE
+
+
 def test_git_invocation_is_lockless_and_uses_only_read_commands(repo, monkeypatch):
     import version_drift.integrate.board as module
     evaluator = board(repo)

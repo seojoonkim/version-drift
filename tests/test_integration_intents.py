@@ -153,6 +153,38 @@ def test_list_is_sorted_and_validates_every_stored_envelope(tmp_path):
         store.list()
 
 
+def test_list_treats_genuinely_absent_store_as_empty(tmp_path):
+    store = IntegrationIntentStore(base_dir=tmp_path / "missing" / "state")
+
+    assert store.list() == []
+    assert not store.directory.exists()
+
+
+def test_list_rejects_regular_file_store_path(tmp_path):
+    store = IntegrationIntentStore(base_dir=tmp_path)
+    store.directory.parent.mkdir(parents=True)
+    store.directory.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises((OSError, ValueError), match="integration-intents|intent store"):
+        store.list()
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+def test_list_rejects_symlinked_store_path(tmp_path, dangling):
+    store = IntegrationIntentStore(base_dir=tmp_path / "state")
+    store.directory.parent.mkdir(parents=True)
+    target = tmp_path / "missing-target"
+    if not dangling:
+        target.mkdir()
+    try:
+        store.directory.symlink_to(target, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises((OSError, ValueError), match="symlink|integration-intents|intent store"):
+        store.list()
+
+
 def test_load_rejects_filename_envelope_id_mismatch(tmp_path):
     store = IntegrationIntentStore(base_dir=tmp_path)
     store.directory.mkdir(parents=True)

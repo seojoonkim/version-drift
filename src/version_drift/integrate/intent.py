@@ -5,6 +5,7 @@ import json
 import os
 import re
 import secrets
+import stat
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -201,6 +202,16 @@ class IntegrationIntentStore:
         return intent
 
     def list(self) -> List[IntegrationIntent]:
-        if not self.directory.exists():
+        try:
+            metadata = self.directory.lstat()
+        except FileNotFoundError:
             return []
-        return [self.load(path.stem) for path in sorted(self.directory.glob("*.json"), key=lambda item: item.name)]
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"integration intent store is a symlink: {self.directory}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"integration intent store is not a directory: {self.directory}")
+        paths = sorted(
+            (path for path in self.directory.iterdir() if path.suffix == ".json"),
+            key=lambda item: item.name,
+        )
+        return [self.load(path.stem) for path in paths]
