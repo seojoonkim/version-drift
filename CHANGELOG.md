@@ -2,6 +2,22 @@
 
 All notable changes to VersionDrift are documented here.
 
+## [1.1.0] - 2026-08-23
+
+### Added
+
+- A read-only agent integration board with immutable intent records, pinned source and target object IDs, deterministic dependency ordering, conflict detection, and fail-closed readiness evaluation.
+- `version-drift integrate intent` and `version-drift integrate board` commands for creating intents and evaluating local integration plans without modifying Git repositories.
+- Machine-readable integration contracts for agent and automation workflows, including explicit status and reason fields plus structured unknown outcomes.
+
+### Changed
+
+- The project README now documents the integration workflow, safety boundary, and local board model.
+
+### Compatibility
+
+- VersionDrift 1.1 is additive within the 1.x contract. Integration commands are read-only and do not authorize merge, rebase, checkout, reset, fetch, or apply operations.
+
 ## [1.0.0] - 2026-08-22
 
 ### Added

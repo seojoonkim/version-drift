@@ -10,7 +10,7 @@ import version_drift
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PUBLIC_SCHEMAS = {
     "version-drift/1",
     "version-drift/scan/1",
@@ -32,7 +32,7 @@ def _project() -> dict:
     }
 
 
-def test_v100_version_python_floor_and_maturity_are_exact_and_coherent():
+def test_v1_version_python_floor_and_maturity_are_exact_and_coherent():
     project = _project()
     assert project["version"] == VERSION
     assert version_drift.__version__ == VERSION
@@ -69,7 +69,7 @@ def test_release_contract_documents_exist_and_name_frozen_contracts():
     assert "no apply process is active" in operations.lower()
 
 
-def test_readme_and_changelog_expose_v100_safety_surface():
+def test_readme_and_changelog_expose_v1_safety_surface():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     required = {
@@ -80,7 +80,7 @@ def test_readme_and_changelog_expose_v100_safety_surface():
     assert not (required - set(token for token in required if token in readme))
     for forbidden_operation in ("reset", "stash", "clean", "merge", "rebase", "push", "force"):
         assert forbidden_operation in readme.lower()
-    assert "## [1.0.0]" in changelog
+    assert "## [1.1.0]" in changelog
     assert "additive" in changelog.lower()
 
 
