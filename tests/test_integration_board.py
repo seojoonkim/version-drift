@@ -213,6 +213,49 @@ def test_cycles_are_blocked_without_harming_acyclic_order(repo):
     assert {x.reason for x in result.items if x.intent_id.startswith("cycle-")} == {ReasonCode.DEPENDENCY_CYCLE}
 
 
+def test_large_graph_cycle_detection_is_bounded_and_precise(repo, monkeypatch):
+    count = 1300
+    evaluator = board(repo)
+    resolved_oid = oid(repo, "HEAD")
+    monkeypatch.setattr(evaluator, "_resolve", lambda ref: resolved_oid)
+
+    def intent(identifier, dependency=()):
+        return IntegrationIntent(
+            schema=INTENT_SCHEMA,
+            intent_id=identifier,
+            agent_id="agent",
+            repository_path=str(repo.resolve()),
+            repository_id="repo-1",
+            source_ref=f"refs/heads/{identifier}",
+            target_ref=evaluator.target_ref,
+            base_oid=resolved_oid,
+            source_oid=resolved_oid,
+            target_oid=resolved_oid,
+            summary="large graph",
+            dependency_intent_ids=dependency,
+            created_at="2026-08-22T10:20:30Z",
+        )
+
+    cycle_ids = [f"cycle-{index:04d}" for index in range(count)]
+    acyclic_ids = [f"ready-{index:04d}" for index in range(count)]
+    intents = [
+        intent(identifier, (cycle_ids[(index + 1) % count],))
+        for index, identifier in enumerate(cycle_ids)
+    ]
+    intents.extend(
+        intent(identifier, () if index == 0 else (acyclic_ids[index - 1],))
+        for index, identifier in enumerate(acyclic_ids)
+    )
+    intents.append(intent("downstream", (cycle_ids[0],)))
+
+    result = evaluator.inspect(intents)
+
+    items = by_id(result)
+    assert all(items[identifier].reason is ReasonCode.DEPENDENCY_CYCLE for identifier in cycle_ids)
+    assert items["downstream"].reason is ReasonCode.DEPENDENCY_NOT_READY
+    assert [item.intent_id for item in result.items if item.status is BoardStatus.READY] == acyclic_ids
+
+
 def snapshot(repo):
     git_dir = repo / ".git"
     index = git_dir / "index"

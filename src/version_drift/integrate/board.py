@@ -237,34 +237,53 @@ class IntegrationBoard:
         on_stack: Set[str] = set()
         cycles: Set[str] = set()
 
-        def visit(node: str) -> None:
-            nonlocal index
-            indices[node] = low[node] = index
+        for root in sorted(active):
+            if root in indices:
+                continue
+            indices[root] = low[root] = index
             index += 1
-            stack.append(node)
-            on_stack.add(node)
-            for dependency in sorted(by_id[node].dependency_intent_ids):
-                if dependency not in active:
-                    continue
-                if dependency not in indices:
-                    visit(dependency)
-                    low[node] = min(low[node], low[dependency])
-                elif dependency in on_stack:
-                    low[node] = min(low[node], indices[dependency])
-            if low[node] == indices[node]:
-                component: List[str] = []
-                while True:
-                    member = stack.pop()
-                    on_stack.remove(member)
-                    component.append(member)
-                    if member == node:
-                        break
-                if len(component) > 1:
-                    cycles.update(component)
+            stack.append(root)
+            on_stack.add(root)
+            frames: List[Tuple[str, List[str], int, Optional[str]]] = [
+                (root, sorted(by_id[root].dependency_intent_ids), 0, None)
+            ]
 
-        for identifier in sorted(active):
-            if identifier not in indices:
-                visit(identifier)
+            while frames:
+                node, dependencies, position, parent = frames[-1]
+                if position < len(dependencies):
+                    dependency = dependencies[position]
+                    frames[-1] = (node, dependencies, position + 1, parent)
+                    if dependency not in active:
+                        continue
+                    if dependency not in indices:
+                        indices[dependency] = low[dependency] = index
+                        index += 1
+                        stack.append(dependency)
+                        on_stack.add(dependency)
+                        frames.append((
+                            dependency,
+                            sorted(by_id[dependency].dependency_intent_ids),
+                            0,
+                            node,
+                        ))
+                    elif dependency in on_stack:
+                        low[node] = min(low[node], indices[dependency])
+                    continue
+
+                frames.pop()
+                if low[node] == indices[node]:
+                    component: List[str] = []
+                    while True:
+                        member = stack.pop()
+                        on_stack.remove(member)
+                        component.append(member)
+                        if member == node:
+                            break
+                    if len(component) > 1:
+                        cycles.update(component)
+                if parent is not None:
+                    low[parent] = min(low[parent], low[node])
+
         return cycles
 
     @staticmethod
