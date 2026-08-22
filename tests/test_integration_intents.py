@@ -130,6 +130,32 @@ def test_create_is_immutable_and_never_overwrites_existing_id(tmp_path):
     assert path.read_bytes() == before
 
 
+@pytest.mark.parametrize("kind", ["directory-symlink", "dangling-symlink", "file"])
+def test_create_rejects_unsafe_final_store_path_without_writing(kind, tmp_path):
+    store = IntegrationIntentStore(base_dir=tmp_path / "state")
+    store.directory.parent.mkdir(parents=True)
+    target = tmp_path / "intent-target"
+    if kind == "file":
+        store.directory.write_text("not a directory", encoding="utf-8")
+    else:
+        if kind == "directory-symlink":
+            target.mkdir()
+        try:
+            store.directory.symlink_to(target, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises((OSError, ValueError), match="symlink|integration-intents|intent store"):
+        store.create(intent())
+
+    if kind == "directory-symlink":
+        assert list(target.iterdir()) == []
+    elif kind == "dangling-symlink":
+        assert not target.exists()
+    else:
+        assert store.directory.read_text(encoding="utf-8") == "not a directory"
+
+
 def test_load_and_create_reject_path_traversal_ids(tmp_path):
     store = IntegrationIntentStore(base_dir=tmp_path)
     for bad_id in ("../escape", "sub/file", ".", "..", "\\windows"):

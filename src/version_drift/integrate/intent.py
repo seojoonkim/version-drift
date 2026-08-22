@@ -168,13 +168,27 @@ class IntegrationIntentStore:
     def _path(self, intent_id: str) -> Path:
         return self.directory / (_intent_id(intent_id) + ".json")
 
+    def _validate_directory(self) -> bool:
+        """Return whether the final store path is an existing real directory."""
+        try:
+            metadata = self.directory.lstat()
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"integration intent store is a symlink: {self.directory}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"integration intent store is not a directory: {self.directory}")
+        return True
+
     def create(self, intent: IntegrationIntent) -> Path:
         # Re-parse so only a fully validated envelope reaches storage.
         validated = IntegrationIntent.from_dict(intent.to_dict())
+        if not self._validate_directory():
+            self.directory.mkdir(parents=True)
+            self._validate_directory()
         destination = self._path(validated.intent_id)
         if destination.exists():
             raise FileExistsError(destination)
-        self.directory.mkdir(parents=True, exist_ok=True)
         temporary = self.directory / f".{validated.intent_id}.{secrets.token_hex(8)}.tmp"
         text = json.dumps(validated.to_dict(), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         try:
@@ -202,14 +216,8 @@ class IntegrationIntentStore:
         return intent
 
     def list(self) -> List[IntegrationIntent]:
-        try:
-            metadata = self.directory.lstat()
-        except FileNotFoundError:
+        if not self._validate_directory():
             return []
-        if stat.S_ISLNK(metadata.st_mode):
-            raise ValueError(f"integration intent store is a symlink: {self.directory}")
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise ValueError(f"integration intent store is not a directory: {self.directory}")
         paths = sorted(
             (path for path in self.directory.iterdir() if path.suffix == ".json"),
             key=lambda item: item.name,

@@ -138,6 +138,38 @@ def test_duplicate_add_is_immutable_and_invalid_or_missing_refs_are_usage_errors
     assert "repository" in error.lower()
 
 
+@pytest.mark.parametrize("kind", ["directory-symlink", "dangling-symlink", "file"])
+def test_add_rejects_unsafe_final_store_path_without_writing_or_changing_git(
+        kind, repo, tmp_path, capsys):
+    state = tmp_path / "state"
+    store_path = state / ".version-drift" / "integration-intents"
+    store_path.parent.mkdir(parents=True)
+    target = tmp_path / "intent-target"
+    if kind == "file":
+        store_path.write_text("not a directory", encoding="utf-8")
+    else:
+        if kind == "directory-symlink":
+            target.mkdir()
+        try:
+            store_path.symlink_to(target, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+    before_git = git_snapshot(repo)
+
+    code, output, error = invoke(capsys, state, *add_args(repo))
+
+    assert code != 0
+    assert output == ""
+    assert "intent store" in error.lower() or "integration-intents" in error
+    assert git_snapshot(repo) == before_git
+    if kind == "directory-symlink":
+        assert list(target.iterdir()) == []
+    elif kind == "dangling-symlink":
+        assert not target.exists()
+    else:
+        assert store_path.read_text(encoding="utf-8") == "not a directory"
+
+
 def test_list_human_and_json_are_deterministic_and_malformed_store_fails_closed(repo, tmp_path, capsys):
     state = tmp_path / "state"
     assert invoke(capsys, state, *add_args(repo, "z"))[0] == 0
