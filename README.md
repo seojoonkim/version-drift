@@ -1,12 +1,24 @@
+<div align="center">
+
 # VersionDrift
 
-VersionDrift is a **local-only, fail-closed safety gate** for checking and selectively fast-forwarding Git repositories. It discovers repositories only below roots you provide, reports drift without changing working files, and blocks apply when repository state or topology is dirty, ambiguous, unsupported, or unknown.
+**Know which Git repositories are safe to advance—and which must not be touched.**
 
-VersionDrift does not provide general multi-repository command execution. Its only working-tree update is a verified clean fast-forward using exactly `git pull --ff-only`.
+Local-only observation. Fail-closed decisions. One deliberately narrow working-tree update: a verified `git pull --ff-only` for clean, behind-only repositories.
 
-## Requirements and installation
+[![Release](https://img.shields.io/github/v/release/seojoonkim/version-drift?label=release)](https://github.com/seojoonkim/version-drift/releases)
+[![PyPI](https://img.shields.io/pypi/v/version-drift)](https://pypi.org/project/version-drift/)
+[![Python](https://img.shields.io/pypi/pyversions/version-drift)](https://pypi.org/project/version-drift/)
+[![CI](https://github.com/seojoonkim/version-drift/actions/workflows/ci.yml/badge.svg)](https://github.com/seojoonkim/version-drift/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/github/license/seojoonkim/version-drift)](LICENSE)
 
-VersionDrift requires Python 3.9 or newer and Git on `PATH`.
+<img src="docs/assets/version-drift-gate.svg" width="100%" alt="VersionDrift observes repositories locally, blocks dirty, ahead, diverged, unsupported, and unknown states, then reinspects, fast-forwards, and verifies only clean behind-only repositories.">
+
+</div>
+
+## Install
+
+Requires **Python 3.9+** and Git on `PATH`.
 
 ```bash
 uv tool install version-drift
@@ -14,7 +26,174 @@ uv tool install version-drift
 pipx install version-drift
 ```
 
-For development:
+VersionDrift runs locally, sends **no telemetry**, and does not upload repository paths, remotes, or results.
+
+## The gate, in one minute
+
+VersionDrift is a **local-only** gate that discovers repositories only below roots you provide. It inspects local Git facts, classifies drift, and keeps dirty, ambiguous, unsupported, or unknown states behind the gate. It is **not** a general multi-repository command runner.
+
+```bash
+# 1. Save roots (validates configuration; does not scan)
+version-drift init ~/code ~/work
+
+# 2. Observe
+version-drift scan
+version-drift inbox --fetch
+
+# 3. Preview decisions (observation only)
+version-drift sync ~/code --plan
+
+# 4. Explicitly apply eligible fast-forwards
+version-drift sync ~/code --apply
+```
+
+> **A `sync --plan` result is observation, never authorization.** Plan evidence may be stale immediately. Apply fetches according to its own flags, takes a per-repository local lock, independently reinspects immediately before pulling, and verifies the result afterward.
+
+Without `--fetch`, `scan`, `inbox`, and `inspect` compare existing local remote-tracking refs. `sync` fetches by default; choose explicitly with `--fetch` or disable it with `--no-fetch`.
+
+## Safety contract
+
+### What it does
+
+- **Observes:** bounded discovery under explicit/resolved roots; inspection of HEAD, upstream, relation, worktree, and required Git metadata.
+- **Blocks by default:** unknown or unreadable facts never become permission.
+- **Allows one case:** an attached, ordinary checkout that tracks an upstream, has a clean worktree, and is behind-only.
+- **Applies one operation:** exactly `git pull --ff-only`, after an immediate independent reinspection.
+- **Verifies:** pull success is not reported as applied until post-pull inspection confirms synchronized state.
+- **Records locally:** decision and lifecycle events support inbox, history, and diagnosis.
+
+### What it never does
+
+- reset, stash, or clean;
+- merge or rebase;
+- push or force operations;
+- guess an upstream;
+- execute arbitrary user-supplied Git commands;
+- treat a scan, dry run, plan, or lock as authorization.
+
+Apply is blocked for dirty, ahead, diverged, missing-upstream, detached, in-progress, shallow, linked-worktree, submodule, and unreadable/unknown states. This includes submodule checkouts and repositories containing tracked submodule metadata. If the head, upstream, worktree fingerprint, eligibility, or required metadata changes before apply, the repository stays blocked.
+
+## Command map
+
+All commands support the global `--base-dir DIR`; machine-readable commands offer `--json`.
+
+- **`init` — save default roots, without scanning**
+  ```bash
+  version-drift init ~/code ~/work [--json]
+  ```
+  Root precedence later is command-line roots, saved configuration, `VERSION_DRIFT_ROOTS`, then the current directory.
+
+- **`scan` — bounded read-only checkup**
+  ```bash
+  version-drift scan ~/code ~/work [--fetch] [--check] [--json]
+  version-drift scan ~/code --max-depth 3
+  ```
+  `--check` exits 1 when drift is present. `--root` is a repeatable compatibility alias.
+
+- **`inbox` — changes since the previous snapshot**
+  ```bash
+  version-drift inbox [~/code] [--fetch] [--json]
+  ```
+  Reports states that are new, changed, or resolved. Snapshots are replaced atomically; corruption is preserved and fails closed rather than silently replacing the baseline.
+
+- **`history` — newest-first local decision trail**
+  ```bash
+  version-drift history
+  version-drift history ~/code/project --event scan --limit 20 --json
+  ```
+  Read-only: never invokes Git, records events, updates snapshots, or creates missing state directories. Malformed JSONL lines are counted and skipped; an unreadable event file fails without modification.
+
+- **`inspect` — inspect one repository**
+  ```bash
+  version-drift inspect ~/code/project [--fetch] [--json]
+  ```
+
+- **`explain` — reasons and safe next actions**
+  ```bash
+  version-drift explain ~/code/project [--json]
+  ```
+  Does not fetch, change Git state, record an event, or update the inbox snapshot.
+
+- **`sync` — plan, preview, or apply the narrow gate**
+  ```bash
+  version-drift sync ~/code --plan [--fetch | --no-fetch] [--json]
+  version-drift sync ~/code               # dry-run preview
+  version-drift sync ~/code --apply [--fetch | --no-fetch] [--json]
+  ```
+  Plan and dry run never update working files or local branches. Unless `--no-fetch` is supplied, they may refresh remote-tracking refs and tags; they also record local VersionDrift events. Apply uses a per-repository local lock, reinspects, runs only `git pull --ff-only` for eligible repositories, then verifies. Locks reduce duplicate local concurrency; they are not authorization.
+
+- **`doctor` — read-only runtime and state diagnostics**
+  ```bash
+  version-drift doctor [--json]
+  ```
+  Checks Python, Git, configuration, events, inbox snapshot, apply locks, and state-directory access. It reports issues but does not create, repair, truncate, or delete state. See the [operations guide](docs/OPERATIONS.md).
+
+`scan`, `inbox`, `explain`, and `sync` also accept `--max-depth N` where applicable; the default discovery depth is 5.
+
+---
+
+## Machine-readable contract
+
+### Frozen v1 schemas
+
+The VersionDrift 1.x safety/report core freezes these schema identifiers and established fields:
+
+- inspection and event report: `version-drift/1`
+- scan envelope: `version-drift/scan/1`
+- sync envelope: `version-drift/sync/1`
+- plan envelope: `version-drift/plan/1`
+- doctor envelope: `version-drift/doctor/1`
+
+Other command contracts are `version-drift/config/1`, `version-drift/inbox/1`, `version-drift/explain/1`, and `version-drift/history/1`.
+
+Legacy report fields are retained. Additive, orthogonal fields and new fail-closed reason/event values may appear in 1.x; consumers must ignore unknown fields and tolerate values that follow existing safety semantics. Fields are not removed, moved, renamed without retaining the legacy field, or given incompatible meaning during 1.x. Semantic breaks—including weaker apply checks—require a new major version and migration guidance. See the exact [VersionDrift 1.x compatibility contract](COMPATIBILITY.md).
+
+### Outcomes
+
+Scan, sync, and plan envelopes report:
+
+- `complete` — required observations/operations completed; repositories may still be policy-blocked.
+- `partial` — some observations/operations failed while others completed; for sync, at least one apply was verified.
+- `failed` — required observations/operations failed with no verified applicable success, as defined by the command.
+
+Outcome is separate from repository relation and eligibility. **Never infer authorization from `complete`.**
+
+### Exit codes
+
+- `0` — command completed under its command-specific policy.
+- `1` — a reported non-operational condition or command failure, including `scan --check` drift, an unhealthy doctor, unsuccessful inspection, failed plan observation, or a single-repository sync policy block.
+- `2` — command-line usage or validation error, including argparse errors.
+- `3` — scan or sync operational `partial` or `failed`, including an uninspectable explicit scope, pull failure, or unverified pull outcome.
+
+JSON consumers should use envelope `outcome` and per-repository reasons as well as the intentionally compressed process exit code.
+
+## State and privacy
+
+Default state locations:
+
+```text
+macOS: ~/Library/Application Support/VersionDrift/events.jsonl
+Linux: ${XDG_STATE_HOME:-~/.local/state}/version-drift/events.jsonl
+```
+
+`inbox_snapshot.json` and `locks/` live beside `events.jsonl`. Configuration lives at:
+
+```text
+macOS: ~/Library/Application Support/VersionDrift/config.toml
+Linux: ${XDG_CONFIG_HOME:-~/.config}/version-drift/config.toml
+```
+
+`--base-dir` and `VERSION_DRIFT_DIR` select an explicit state root; for compatibility, explicit roots use `.version-drift/` beneath that root.
+
+State can contain local paths, remote URLs, branches, and Git status facts. Treat it as private operational data, exclude it from public logs, and put no secrets in configuration. Event history is append-only during normal recording, but it is diagnostic—not tamper-evident. For recovery, held locks, and `outcome_unknown`, follow [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+## Boundaries and compatibility
+
+VersionDrift is a local safety tool, **not a security boundary**, authorization system, sandbox, malware defense, transaction manager, or complete defense against data loss. It trusts the local OS, Python runtime, selected Git executable/configuration, and relevant filesystem behavior. Same-user writers and TOCTOU races remain possible; Git hooks, filters, helpers, remotes, and network behavior are not sandboxed. Keep independent repository backups.
+
+Discovery stays below supplied/resolved roots and does not follow directory symlinks. Apply blocks unsupported topology rather than attempting to make it safe. Review the full [threat model](THREAT_MODEL.md), [compatibility contract](COMPATIBILITY.md), and [operations guide](docs/OPERATIONS.md) before automation.
+
+## Development
 
 ```bash
 git clone https://github.com/seojoonkim/version-drift.git
@@ -22,131 +201,6 @@ cd version-drift
 python -m pip install -e .
 ```
 
-## Start with a local checkup
+Bug reports and focused pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md), the [changelog](CHANGELOG.md), or [open an issue](https://github.com/seojoonkim/version-drift/issues).
 
-```bash
-version-drift init ~/code ~/work
-version-drift scan
-version-drift inbox --fetch
-```
-
-- `init` validates and saves roots without scanning.
-- `scan` inspects all discovered repositories and records local decision events.
-- `inbox` reports repository states that are new, changed, or resolved since its previous snapshot.
-- `history` reads the local JSONL decision trail newest-first.
-- Configuration precedence is command-line roots, saved configuration, `VERSION_DRIFT_ROOTS`, then the current directory.
-
-Without `--fetch`, observation uses existing local remote-tracking refs. With `--fetch`, `scan`, `inbox`, and `inspect` refresh refs before comparison. Sync fetches by default; select that behavior explicitly with `--fetch` or disable it with `--no-fetch`.
-
-## Safety contract
-
-VersionDrift applies only a clean, attached, ordinary checkout that tracks an upstream and is behind-only. Unsupported or unknown topology is blocked, including detached HEAD, an in-progress Git operation, shallow repositories, linked worktrees, submodule checkouts, repositories containing tracked submodule metadata, and unreadable required Git metadata.
-
-VersionDrift never automatically performs:
-
-- reset, stash, or clean operations;
-- merge or rebase operations;
-- push or force operations;
-- upstream guessing;
-- arbitrary user-supplied Git commands.
-
-`sync --apply` independently reinspects each repository immediately before pulling. A prior scan or plan is observation, not authorization. If the head, upstream, worktree fingerprint, eligibility, or required metadata no longer agrees, apply is blocked. The only pull command is `git pull --ff-only`; success is then reinspected and must be verified.
-
-## Commands
-
-### Scan
-
-```bash
-version-drift scan ~/code ~/work [--fetch] [--check] [--json]
-```
-
-`--check` exits 1 when drift is present. `--max-depth N` bounds discovery.
-
-### Inbox and configuration
-
-```bash
-version-drift init ~/code ~/work
-version-drift inbox [--fetch] [--json]
-```
-
-Inbox snapshots are replaced atomically. A corrupt snapshot is preserved and causes a fail-closed error rather than silently replacing the baseline.
-
-### History
-
-```bash
-version-drift history
-version-drift history ~/code/project --event scan --limit 20 --json
-```
-
-History is read-only: it never invokes Git, records events, updates snapshots, or creates missing state directories. Malformed JSONL lines are counted and skipped; an unreadable event file fails without being modified.
-
-### Inspect and explain
-
-```bash
-version-drift inspect ~/code/project [--fetch] [--json]
-version-drift explain ~/code/project [--json]
-```
-
-`explain` converts inspection states into reasons and safe next actions. It does not fetch, change Git state, record an event, or update the inbox snapshot.
-
-### Plan or synchronize
-
-```bash
-version-drift sync ~/code --plan [--fetch | --no-fetch] [--json]
-version-drift sync ~/code               # dry-run preview
-version-drift sync ~/code --apply [--fetch | --no-fetch] [--json]
-```
-
-`sync --plan` records structured decisions but changes no repository. A plan never authorizes a later apply. Dry-run sync also changes no repository. Apply takes a per-repository local lock, reinspects immediately before pull, and verifies afterward. Locks reduce duplicate local concurrency; they are not authorization.
-
-### Doctor
-
-```bash
-version-drift doctor [--json]
-```
-
-`doctor` performs read-only checks of the Python runtime, Git executable, configuration, event history, inbox snapshot, apply locks, and state directory. It reports issues but does not repair or delete files. See [operations guidance](docs/OPERATIONS.md).
-
-## JSON contracts and outcomes
-
-The frozen v1 schemas are:
-
-- inspection/event report: `version-drift/1`
-- scan envelope: `version-drift/scan/1`
-- sync envelope: `version-drift/sync/1`
-- plan envelope: `version-drift/plan/1`
-- doctor envelope: `version-drift/doctor/1`
-
-Other command schemas include `version-drift/config/1`, `version-drift/inbox/1`, `version-drift/explain/1`, and `version-drift/history/1`.
-
-Scan, sync, and plan envelopes use `complete`, `partial`, or `failed`. These describe whether inspection or operations completed, not whether every repository was eligible. A policy-blocked repository can occur in a `complete` run. See [COMPATIBILITY.md](COMPATIBILITY.md) for the exact 1.x API and migration rules.
-
-## Exit codes
-
-- `0`: command completed under its command-specific policy.
-- `1`: drift requested by `scan --check`, an unhealthy `doctor`, an unsuccessful inspection, a single-repository policy block, or another reported command failure.
-- `2`: command-line usage or validation error, including argparse errors.
-- `3`: sync operational failure (`partial` or `failed`), distinct from an ordinary policy block.
-
-JSON consumers should use the envelope `outcome` and per-repository reasons as well as the process exit code.
-
-## Local state and privacy
-
-Default state paths:
-
-```text
-macOS: ~/Library/Application Support/VersionDrift/events.jsonl
-Linux: ${XDG_STATE_HOME:-~/.local/state}/version-drift/events.jsonl
-```
-
-`inbox_snapshot.json` and `locks/` live beside `events.jsonl`. Configuration is at `~/Library/Application Support/VersionDrift/config.toml` on macOS or `${XDG_CONFIG_HOME:-~/.config}/version-drift/config.toml` on Linux. `--base-dir` and `VERSION_DRIFT_DIR` select an explicit state root; for compatibility, explicit roots use `.version-drift/` beneath that root.
-
-State contains local paths and Git metadata. VersionDrift sends no telemetry and does not upload repository paths, remotes, or results. Treat state files as private local operational data and do not put secrets in configuration. See [THREAT_MODEL.md](THREAT_MODEL.md) for boundaries and residual risks.
-
-## Compatibility
-
-The VersionDrift 1.x public contract preserves legacy report fields and permits only additive, orthogonal fields and values that follow the documented compatibility rules. Removals or semantic breaks require a new major version. Safety invariants cannot be weakened for convenience.
-
-## Contributing and license
-
-Bug reports and focused pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). VersionDrift is licensed under the [MIT License](LICENSE).
+VersionDrift is licensed under the [MIT License](LICENSE).
