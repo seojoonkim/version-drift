@@ -154,7 +154,7 @@ version-drift integrate board ~/code/project \
 
 `intent add` resolves source and target locally and writes only VersionDrift's external local intent state; an existing intent ID is never overwritten. `intent list` and `board` are strictly read-only: no branches are merged, no conflicts are resolved, and no Git refs, worktrees, or indexes are changed. The board reports a deterministic dependency order and stable reason codes. A ref moving away from its pinned OID makes an intent `STALE`; an unobservable ref or malformed store is `UNKNOWN`, and **UNKNOWN = BLOCKED** for policy purposes.
 
-Board exit codes are exact: `0` for `READY`, `1` for `BLOCKED` or `STALE`, `2` for CLI/repository/ref validation errors, and `3` for `UNKNOWN` (including malformed state). Intent/list operational failures follow the general exit-code contract below.
+Board exit codes are exact: `0` for `READY`, `1` for `BLOCKED` or `STALE`, `2` for invalid CLI or repository arguments, and `3` for `UNKNOWN` (including an unobservable selected board ref or malformed state). Intent/list operational failures follow the general exit-code contract below.
 
 This shipped MVP does **not** perform merge-tree analysis, propose or apply integrations, resolve conflicts, acquire leases, create sandboxes/worktrees, or invoke an LLM. Those are future ideas, not current capabilities.
 

@@ -124,7 +124,9 @@ def test_missing_ref_and_malformed_git_output_fail_closed(repo, monkeypatch):
 
     monkeypatch.setattr(module.subprocess, "run", malformed)
     result = board(repo).inspect([valid])
-    assert (result.items[0].status, result.items[0].reason) == (BoardStatus.UNKNOWN, ReasonCode.SOURCE_REF_UNOBSERVABLE)
+    assert result.status is BoardStatus.UNKNOWN
+    assert result.reason is ReasonCode.TARGET_REF_UNOBSERVABLE
+    assert result.items == ()
 
 
 def test_duplicate_source_ownership_blocks_all_claimants(repo):
@@ -135,25 +137,58 @@ def test_duplicate_source_ownership_blocks_all_claimants(repo):
     ]
 
 
+def test_duplicate_source_ownership_includes_stale_claimants(repo):
+    result = board(repo).inspect([
+        make_intent(repo, "ready"),
+        make_intent(repo, "stale", source_oid="0" * 40),
+    ])
+    assert [(x.intent_id, x.status, x.reason) for x in result.items] == [
+        ("ready", BoardStatus.BLOCKED, ReasonCode.DUPLICATE_SOURCE_REF),
+        ("stale", BoardStatus.BLOCKED, ReasonCode.DUPLICATE_SOURCE_REF),
+    ]
+
+
 def test_missing_cross_board_and_nonready_dependencies_block(repo, tmp_path):
     other_path = tmp_path / "elsewhere"
+    for name in ("missing-dep", "foreign-dep", "stale", "uses-stale"):
+        git(repo, "update-ref", f"refs/heads/{name}", oid(repo, "refs/heads/feature"))
     intents = [
-        make_intent(repo, "missing", dependencies=("absent",)),
+        make_intent(repo, "missing", source_ref="refs/heads/missing-dep", dependencies=("absent",)),
         make_intent(repo, "foreign", repository_id="other"),
-        make_intent(repo, "uses-foreign", source_ref="refs/heads/other", dependencies=("foreign",)),
-        make_intent(repo, "stale", source_ref="refs/heads/other", source_oid="0" * 40),
-        make_intent(repo, "uses-stale", dependencies=("stale",)),
+        make_intent(repo, "uses-foreign", source_ref="refs/heads/foreign-dep", dependencies=("foreign",)),
+        make_intent(repo, "stale", source_ref="refs/heads/stale", source_oid="0" * 40),
+        make_intent(repo, "uses-stale", source_ref="refs/heads/uses-stale", dependencies=("stale",)),
         make_intent(repo, "path", repository_path=str(other_path.resolve())),
         make_intent(repo, "target", target_ref="refs/heads/other"),
     ]
     result = board(repo).inspect(intents)
     items = by_id(result)
     assert items["missing"].reason is ReasonCode.MISSING_DEPENDENCY
-    assert items["foreign"].reason is ReasonCode.REPOSITORY_MISMATCH
-    assert items["path"].reason is ReasonCode.REPOSITORY_MISMATCH
-    assert items["target"].reason is ReasonCode.TARGET_MISMATCH
+    assert "foreign" not in items
+    assert "path" not in items
+    assert "target" not in items
     assert items["uses-foreign"].reason is ReasonCode.DEPENDENCY_OUTSIDE_BOARD
     assert items["uses-stale"].reason is ReasonCode.DEPENDENCY_NOT_READY
+
+
+def test_unrelated_repository_and_target_intents_do_not_contaminate_ready_board(repo, tmp_path):
+    result = board(repo).inspect([
+        make_intent(repo, "ready"),
+        make_intent(repo, "other-repository", repository_id="other"),
+        make_intent(repo, "other-path", repository_path=str((tmp_path / "elsewhere").resolve())),
+        make_intent(repo, "other-target", target_ref="refs/heads/other"),
+    ])
+
+    assert result.status is BoardStatus.READY
+    assert [item.intent_id for item in result.items] == ["ready"]
+
+
+def test_unobservable_selected_target_is_unknown_even_without_scoped_intents(repo):
+    result = IntegrationBoard(repo, "repo-1", "refs/heads/missing").inspect([])
+
+    assert result.status is BoardStatus.UNKNOWN
+    assert result.reason is ReasonCode.TARGET_REF_UNOBSERVABLE
+    assert result.items == ()
 
 
 def test_cycles_are_blocked_without_harming_acyclic_order(repo):

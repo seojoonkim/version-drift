@@ -133,26 +133,22 @@ class IntegrationBoard:
         by_id = {value.intent_id: value for value in values}
         if len(by_id) != len(values):
             return self._failure(ReasonCode.MALFORMED_INTENT_SET)
+        target_oid = self._resolve(self.target_ref)
+        if target_oid is None:
+            return self._failure(ReasonCode.TARGET_REF_UNOBSERVABLE)
 
         items: Dict[str, BoardItem] = {}
         scoped: Set[str] = set()
         for intent in sorted(values, key=lambda value: value.intent_id):
             if (str(Path(intent.repository_path).resolve()) != self.repository_path
                     or intent.repository_id != self.repository_id):
-                items[intent.intent_id] = self._item(
-                    intent, BoardStatus.BLOCKED, ReasonCode.REPOSITORY_MISMATCH, None, None)
                 continue
             if intent.target_ref != self.target_ref:
-                items[intent.intent_id] = self._item(
-                    intent, BoardStatus.BLOCKED, ReasonCode.TARGET_MISMATCH, None, None)
                 continue
             scoped.add(intent.intent_id)
             source_oid = self._resolve(intent.source_ref)
-            target_oid = self._resolve(intent.target_ref)
             if source_oid is None:
                 state = (BoardStatus.UNKNOWN, ReasonCode.SOURCE_REF_UNOBSERVABLE)
-            elif target_oid is None:
-                state = (BoardStatus.UNKNOWN, ReasonCode.TARGET_REF_UNOBSERVABLE)
             elif source_oid != intent.source_oid:
                 state = (BoardStatus.STALE, ReasonCode.SOURCE_OID_CHANGED)
             elif target_oid != intent.target_oid:
@@ -160,6 +156,16 @@ class IntegrationBoard:
             else:
                 state = (BoardStatus.READY, None)
             items[intent.intent_id] = self._item(intent, state[0], state[1], source_oid, target_oid)
+
+        # Every in-scope intent owns its source claim, independent of its observed state.
+        claims: Dict[str, List[str]] = {}
+        for identifier in scoped:
+            claims.setdefault(by_id[identifier].source_ref, []).append(identifier)
+        for owners in claims.values():
+            if len(owners) > 1:
+                for identifier in owners:
+                    items[identifier] = replace(items[identifier], status=BoardStatus.BLOCKED,
+                                                reason=ReasonCode.DUPLICATE_SOURCE_REF)
 
         candidates = {identifier for identifier in scoped if items[identifier].status is BoardStatus.READY}
         for identifier in sorted(tuple(candidates)):
@@ -183,18 +189,6 @@ class IntegrationBoard:
         for identifier in cycles:
             items[identifier] = replace(items[identifier], status=BoardStatus.BLOCKED,
                                         reason=ReasonCode.DEPENDENCY_CYCLE)
-        self._propagate_nonready(items, by_id, scoped)
-
-        # Ownership conflicts apply only to intents that would otherwise be ready.
-        claims: Dict[str, List[str]] = {}
-        for identifier in scoped:
-            if items[identifier].status is BoardStatus.READY:
-                claims.setdefault(by_id[identifier].source_ref, []).append(identifier)
-        for owners in claims.values():
-            if len(owners) > 1:
-                for identifier in owners:
-                    items[identifier] = replace(items[identifier], status=BoardStatus.BLOCKED,
-                                                reason=ReasonCode.DUPLICATE_SOURCE_REF)
         self._propagate_nonready(items, by_id, scoped)
 
         active = {identifier for identifier in scoped if items[identifier].status is BoardStatus.READY}

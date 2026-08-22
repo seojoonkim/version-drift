@@ -361,7 +361,6 @@ def _run_integrate(args: argparse.Namespace, base_dir: Optional[str]) -> int:
                 _print_intents(intents)
             return 0
 
-        _resolve_commit(repository, args.target_ref, "target")
         result = IntegrationBoard(repository, args.repository_id, args.target_ref).inspect_store(store)
         payload = result.to_dict()
         if args.json:

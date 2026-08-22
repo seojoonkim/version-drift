@@ -101,6 +101,22 @@ def test_add_pins_full_oids_normalizes_repo_and_prints_human_and_json(repo, tmp_
     assert payload["dependency_intent_ids"] == ["intent-a"]
 
 
+def test_add_changes_only_external_version_drift_state(repo, tmp_path, capsys):
+    state = tmp_path / "external-state"
+    (repo / "tracked.txt").write_text("working tree edit\n", encoding="utf-8")
+    (repo / "untracked.txt").write_text("preserve me\n", encoding="utf-8")
+    before = git_snapshot(repo)
+
+    code, _, error = invoke(capsys, state, *add_args(repo))
+
+    assert (code, error) == (0, "")
+    assert (state / ".version-drift/integration-intents/intent-a.json").is_file()
+    assert git_snapshot(repo) == before
+    assert before["refs"] and before["index"] and before["worktree"]
+    assert before["worktree"]["tracked.txt"] == b"working tree edit\n"
+    assert before["worktree"]["untracked.txt"] == b"preserve me\n"
+
+
 def test_duplicate_add_is_immutable_and_invalid_or_missing_refs_are_usage_errors(repo, tmp_path, capsys):
     state = tmp_path / "state"
     assert invoke(capsys, state, *add_args(repo))[0] == 0
@@ -222,10 +238,16 @@ def test_list_and_board_do_not_mutate_nonvacuous_git_or_state(repo, tmp_path, ca
     assert before_git["refs"] and before_git["index"] and before_git["worktree"]
 
 
-def test_board_rejects_missing_target_before_inspection(repo, tmp_path, capsys):
+def test_board_reports_missing_target_as_structured_unknown(repo, tmp_path, capsys):
     state = tmp_path / "state"
-    command = ["integrate", "board", str(repo), "--repository-id", "local-repo-1", "--target", "missing"]
+    command = [
+        "integrate", "board", str(repo), "--repository-id", "local-repo-1",
+        "--target", "missing", "--json",
+    ]
     code, output, error = invoke(capsys, state, *command)
-    assert code == 2
-    assert output == ""
-    assert "cannot resolve target ref" in error
+    assert code == 3
+    assert error == ""
+    payload = json.loads(output)
+    assert payload["status"] == "UNKNOWN"
+    assert payload["reason"] == "TARGET_REF_UNOBSERVABLE"
+    assert payload["items"] == []
