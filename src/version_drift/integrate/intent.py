@@ -195,17 +195,26 @@ class IntegrationIntentStore:
         if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
             raise RuntimeError("secure integration intent entry access is unavailable")
         flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
         entry_fd = os.open(name, flags, dir_fd=directory_fd)
-        if not stat.S_ISREG(os.fstat(entry_fd).st_mode):
+        try:
+            if not stat.S_ISREG(os.fstat(entry_fd).st_mode):
+                raise ValueError(f"integration intent entry is not a regular file: {name}")
+        except BaseException:
             os.close(entry_fd)
-            raise ValueError(f"integration intent entry is not a regular file: {name}")
+            raise
         return entry_fd
 
     def _load_from_directory(self, directory_fd: int, intent_id: str) -> IntegrationIntent:
         name = _intent_id(intent_id) + ".json"
         try:
             entry_fd = self._open_entry(directory_fd, name)
-            with os.fdopen(entry_fd, "r", encoding="utf-8") as source:
+            try:
+                source = os.fdopen(entry_fd, "r", encoding="utf-8")
+            except BaseException:
+                os.close(entry_fd)
+                raise
+            with source:
                 payload = json.load(source, object_pairs_hook=_unique_object)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             if isinstance(exc, FileNotFoundError):

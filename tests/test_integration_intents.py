@@ -305,3 +305,106 @@ def test_reads_reject_symlinked_json_entry(operation, tmp_path):
             store.list()
         else:
             store.load("intent-001")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="FIFO regression is POSIX-only")
+@pytest.mark.parametrize("operation", ["list", "load"])
+def test_reads_open_fifo_nonblocking_and_reject_it(monkeypatch, operation, tmp_path):
+    import version_drift.integrate.intent as module
+
+    if not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"):
+        pytest.skip("nonblocking FIFO opens are unavailable")
+    store = IntegrationIntentStore(base_dir=tmp_path / "state")
+    store.directory.mkdir(parents=True)
+    os.mkfifo(store.directory / "intent-001.json")
+    original_open = os.open
+
+    def assert_nonblocking_open(path, flags, *args, **kwargs):
+        if path == "intent-001.json":
+            assert flags & os.O_NONBLOCK
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "supports_dir_fd", os.supports_dir_fd | {assert_nonblocking_open})
+    monkeypatch.setattr(module.os, "open", assert_nonblocking_open)
+    with pytest.raises(ValueError, match="regular file|cannot load"):
+        store.list() if operation == "list" else store.load("intent-001")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor regression is POSIX-only")
+@pytest.mark.parametrize("operation", ["list", "load"])
+def test_entry_fd_is_closed_once_when_fstat_raises(monkeypatch, operation, tmp_path):
+    import version_drift.integrate.intent as module
+
+    store = IntegrationIntentStore(base_dir=tmp_path / "state")
+    store.create(intent())
+    original_open = os.open
+    original_fstat = os.fstat
+    original_close = os.close
+    entry_fds = []
+    closed_entry_fds = []
+
+    def track_open(path, flags, *args, **kwargs):
+        fd = original_open(path, flags, *args, **kwargs)
+        if path == "intent-001.json":
+            entry_fds.append(fd)
+        return fd
+
+    def fail_entry_fstat(fd):
+        if fd in entry_fds:
+            raise OSError("injected fstat failure")
+        return original_fstat(fd)
+
+    def track_close(fd):
+        if fd in entry_fds:
+            closed_entry_fds.append(fd)
+        return original_close(fd)
+
+    monkeypatch.setattr(module.os, "supports_dir_fd", os.supports_dir_fd | {track_open})
+    monkeypatch.setattr(module.os, "open", track_open)
+    monkeypatch.setattr(module.os, "fstat", fail_entry_fstat)
+    monkeypatch.setattr(module.os, "close", track_close)
+    with pytest.raises(ValueError, match="cannot load"):
+        store.list() if operation == "list" else store.load("intent-001")
+
+    assert len(entry_fds) == 1
+    assert closed_entry_fds == entry_fds
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor regression is POSIX-only")
+@pytest.mark.parametrize("operation", ["list", "load"])
+def test_entry_fd_is_closed_once_when_fdopen_raises(monkeypatch, operation, tmp_path):
+    import version_drift.integrate.intent as module
+
+    store = IntegrationIntentStore(base_dir=tmp_path / "state")
+    store.create(intent())
+    original_open = os.open
+    original_fdopen = os.fdopen
+    original_close = os.close
+    entry_fds = []
+    closed_entry_fds = []
+
+    def track_open(path, flags, *args, **kwargs):
+        fd = original_open(path, flags, *args, **kwargs)
+        if path == "intent-001.json":
+            entry_fds.append(fd)
+        return fd
+
+    def fail_entry_fdopen(fd, *args, **kwargs):
+        if fd in entry_fds:
+            raise OSError("injected fdopen failure")
+        return original_fdopen(fd, *args, **kwargs)
+
+    def track_close(fd):
+        if fd in entry_fds:
+            closed_entry_fds.append(fd)
+        return original_close(fd)
+
+    monkeypatch.setattr(module.os, "supports_dir_fd", os.supports_dir_fd | {track_open})
+    monkeypatch.setattr(module.os, "open", track_open)
+    monkeypatch.setattr(module.os, "fdopen", fail_entry_fdopen)
+    monkeypatch.setattr(module.os, "close", track_close)
+    with pytest.raises(ValueError, match="cannot load"):
+        store.list() if operation == "list" else store.load("intent-001")
+
+    assert len(entry_fds) == 1
+    assert closed_entry_fds == entry_fds
