@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="400" viewBox="0 0 1200 400" role="img" aria-labelledby="title desc">
+  <title id="title">VersionDrift local safety gate</title>
+  <desc id="desc">Observe Git repositories locally, block unknown states, and apply only a verified fast-forward to clean behind-only repositories.</desc>
+  <defs>
+    <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#18212a"/>
+      <stop offset="1" stop-color="#10161c"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#263440" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="400" rx="20" fill="#0b1015"/>
+  <rect x="18" y="18" width="1164" height="364" rx="12" fill="url(#panel)" stroke="#3b4a56" stroke-width="2"/>
+  <rect x="19" y="19" width="1162" height="362" rx="11" fill="url(#grid)" opacity=".45"/>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+    <text x="56" y="70" fill="#a8b6bf" font-size="32" font-weight="700" letter-spacing="3">LOCAL SAFETY CIRCUIT</text>
+    <circle cx="1125" cy="61" r="10" fill="#52d18c"/>
+
+    <g transform="translate(56 112)">
+      <rect width="310" height="210" rx="10" fill="#111a21" stroke="#526573" stroke-width="3"/>
+      <text x="25" y="55" fill="#81c9f3" font-size="32" font-weight="700">01 / OBSERVE</text>
+      <text x="25" y="120" fill="#f3f6f8" font-size="44" font-weight="700">LOCAL</text>
+      <text x="25" y="174" fill="#b9c6ce" font-size="34">Inspect Git</text>
+    </g>
+
+    <path d="M384 217H423" stroke="#718592" stroke-width="5"/>
+    <path d="m413 205 14 12-14 12" fill="none" stroke="#718592" stroke-width="5"/>
+
+    <g transform="translate(445 112)">
+      <rect width="310" height="210" rx="10" fill="#111a21" stroke="#d6a84b" stroke-width="3"/>
+      <text x="25" y="55" fill="#f0bd55" font-size="32" font-weight="700">02 / DECIDE</text>
+      <text x="25" y="120" fill="#f3f6f8" font-size="42" font-weight="700">FAIL CLOSED</text>
+      <rect x="25" y="143" width="260" height="43" rx="4" fill="#382a1b"/>
+      <text x="155" y="173" fill="#ffc95c" font-size="27" font-weight="700" text-anchor="middle">UNKNOWN = BLOCKED</text>
+    </g>
+
+    <path d="M773 217H812" stroke="#718592" stroke-width="5"/>
+    <path d="m802 205 14 12-14 12" fill="none" stroke="#718592" stroke-width="5"/>
+
+    <g transform="translate(834 112)">
+      <rect width="310" height="210" rx="10" fill="#111a21" stroke="#52d18c" stroke-width="3"/>
+      <text x="25" y="55" fill="#67dda0" font-size="32" font-weight="700">03 / APPLY</text>
+      <text x="25" y="120" fill="#f3f6f8" font-size="44" font-weight="700">FF-ONLY</text>
+      <text x="25" y="174" fill="#8aebb6" font-size="32" font-weight="700">Reinspect · verify</text>
+    </g>
+
+    <text x="600" y="363" fill="#a8b6bf" font-size="29" font-weight="700" text-anchor="middle">CLEAN + BEHIND-ONLY PASSES  ·  EVERYTHING ELSE STAYS BLOCKED</text>
+  </g>
+</svg>
