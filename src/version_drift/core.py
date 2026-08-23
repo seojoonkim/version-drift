@@ -76,7 +76,12 @@ def _run_git(
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return GitResult(False, stderr=str(exc), returncode=124)
-    return GitResult(proc.returncode == 0, proc.stdout.strip(), proc.stderr.strip(), proc.returncode)
+    return GitResult(
+        proc.returncode == 0,
+        proc.stdout.rstrip("\r\n"),
+        proc.stderr.strip(),
+        proc.returncode,
+    )
 
 
 def default_roots() -> List[str]:

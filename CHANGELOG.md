@@ -2,6 +2,16 @@
 
 All notable changes to VersionDrift are documented here.
 
+## [1.1.1] - 2026-08-23
+
+### Fixed
+
+- Preserve the full path in machine-readable `dirty_paths` output for unstaged files whose Git porcelain status begins with a space.
+
+### Security
+
+- Pin third-party GitHub Actions to immutable commit SHAs and add CodeQL analysis for Python changes.
+
 ## [1.1.0] - 2026-08-23
 
 ### Added
