@@ -10,7 +10,7 @@ import version_drift
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 PUBLIC_SCHEMAS = {
     "version-drift/1",
     "version-drift/scan/1",
@@ -80,7 +80,7 @@ def test_readme_and_changelog_expose_v1_safety_surface():
     assert not (required - set(token for token in required if token in readme))
     for forbidden_operation in ("reset", "stash", "clean", "merge", "rebase", "push", "force"):
         assert forbidden_operation in readme.lower()
-    assert "## [1.1.0]" in changelog
+    assert "## [1.1.1]" in changelog
     assert "additive" in changelog.lower()
 
 

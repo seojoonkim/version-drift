@@ -234,6 +234,39 @@ def test_inspect_protects_untracked_work(tmp_path):
     assert untracked.read_text(encoding="utf-8") == "keep me\n"
 
 
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("staged", "staged.txt"),
+        ("unstaged", "unstaged.txt"),
+        ("untracked", "untracked.txt"),
+        ("renamed", "rename-old.txt -> rename-new.txt"),
+    ],
+)
+def test_dirty_paths_preserve_porcelain_paths_for_each_status(tmp_path, case, expected):
+    repo = tmp_path / case
+    _init_repo(repo)
+
+    if case == "untracked":
+        (repo / expected).write_text("untracked\n", encoding="utf-8")
+    elif case == "renamed":
+        (repo / "rename-old.txt").write_text("original\n", encoding="utf-8")
+        _git(repo, "add", "rename-old.txt")
+        _git(repo, "commit", "-m", "add rename fixture")
+        _git(repo, "mv", "rename-old.txt", "rename-new.txt")
+    else:
+        (repo / expected).write_text("original\n", encoding="utf-8")
+        _git(repo, "add", expected)
+        _git(repo, "commit", "-m", f"add {case} fixture")
+        (repo / expected).write_text(f"{case}\n", encoding="utf-8")
+        if case == "staged":
+            _git(repo, "add", expected)
+
+    report = inspect_project(str(repo))
+
+    assert report["dirty_paths"] == [expected]
+
+
 def test_inspect_protects_dirty_repository_that_is_behind(tmp_path):
     seed, _, clone = _remote_clone(tmp_path)
     (clone / "notes.txt").write_text("keep me\n", encoding="utf-8")
@@ -473,4 +506,4 @@ def test_cli_version_falls_back_to_source_version_without_distribution_metadata(
     except SystemExit as exc:
         assert exc.code == 0
 
-    assert capsys.readouterr().out.strip() == "version-drift 1.1.0"
+    assert capsys.readouterr().out.strip() == "version-drift 1.1.1"
